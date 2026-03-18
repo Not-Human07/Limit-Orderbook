@@ -134,7 +134,7 @@ int main()
     eng.add_symbol("AAPL");
     eng.add_symbol("TSLA");
 
-    // ── Run demo scenarios ────────────────────────────────────────────────
+    // Run demo scenarios
 
     demo_basic_limit_match(eng);
     demo_partial_fill(eng);
