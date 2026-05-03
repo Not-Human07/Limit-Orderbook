@@ -1,195 +1,225 @@
 #include "order_book.hpp"
 
-#include <iostream>
-#include <iomanip>
-#include <stdexcept>
+#include <algorithm>
 #include <cassert>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <stdexcept>
 
-// BookSide
 
-template <typename Comp>
-void BookSide<Comp>::add(std::unique_ptr<Order> order)
+// LatencyStats
+
+LatencyStats::Percentiles LatencyStats::compute() const
 {
-    Price    p  = order->price();
-    OrderId  id = order->id();
+    if (count == 0) return {};
 
-    // Create the level if it doesn't exist yet.
-    auto level_it = levels_.find(p);
-    if (level_it == levels_.end()) {
-        auto [it, ok] = levels_.emplace(p, PriceLevel{ .price = p });
-        level_it = it;
-    }
+    std::vector<std::uint64_t> sorted(samples.begin(),
+                                       samples.begin() + count);
+    std::sort(sorted.begin(), sorted.end());
 
-    PriceLevel& lvl = level_it->second;
-    lvl.total_qty  += order->remaining_qty();
-    lvl.orders.push_back(std::move(order));
-
-    auto order_it = std::prev(lvl.orders.end());
-    index_.emplace(id, Locator{ level_it, order_it });
-}
-
-template <typename Comp>
-bool BookSide<Comp>::cancel(OrderId id)
-{
-    auto idx = index_.find(id);
-    if (idx == index_.end())
-        return false;
-
-    auto& [level_it, order_it] = idx->second;
-    PriceLevel& lvl = level_it->second;
-
-    Order& o = **order_it;
-    if (!o.is_active()) {
-        index_.erase(idx);
-        return false;
-    }
-
-    lvl.total_qty -= o.remaining_qty();
-    o.cancel();
-    lvl.orders.erase(order_it);
-
-    if (lvl.empty())
-        levels_.erase(level_it);
-
-    index_.erase(idx);
-    return true;
-}
-
-template <typename Comp>
-std::vector<std::pair<Price, Quantity>> BookSide<Comp>::depth(std::size_t n) const
-{
-    std::vector<std::pair<Price, Quantity>> out;
-    out.reserve(n);
-
-    for (auto& [price, lvl] : levels_) {
-        if (out.size() == n) break;
-        out.emplace_back(price, lvl.total_qty);
-    }
-    return out;
-}
-
-// Explicit instantiations — keeps the linker happy without moving all this into the header.
-template class BookSide<std::greater<Price>>;
-template class BookSide<std::less<Price>>;
-
-// OrderBook
-
-OrderBook::OrderBook(std::string symbol, TradeCallback on_trade)
-    : symbol_(std::move(symbol))
-    , on_trade_(std::move(on_trade))
-{}
-
-// Matching logic
-
-// Price-time priority:
-//   1. Walk the opposite side level by level (best price first).
-//   2. Within a level, drain orders front-to-back (time priority).
-//   3. Stop when the aggressor is fully filled or there's no crossable price.
-
-std::vector<Trade> OrderBook::match(Order& aggressor)
-{
-    std::vector<Trade> trades;
-
-    bool is_buy = aggressor.side() == Side::Buy;
-
-    // Lambda to decide whether two prices cross.
-    auto prices_cross = [&](Price resting_price) -> bool {
-        if (aggressor.type() == OrderType::Market)
-            return true;
-        return is_buy ? (aggressor.price() >= resting_price)
-                      : (aggressor.price() <= resting_price);
+    auto pct = [&](double p) -> std::uint64_t {
+        std::size_t idx = static_cast<std::size_t>(p * (sorted.size() - 1));
+        return sorted[idx];
     };
 
-    auto& opposite = is_buy ? static_cast<BookSide<std::less<Price>>&>(asks_)
-                             : static_cast<BookSide<std::greater<Price>>&>(bids_);
-
-    while (aggressor.is_active() && !opposite.empty()) {
-        PriceLevel* lvl = opposite.best();
-        if (!lvl || !prices_cross(lvl->price))
-            break;
-
-        // Drain the level front-to-back.
-        while (aggressor.is_active() && !lvl->empty()) {
-            Order& resting = *lvl->front();
-            assert(resting.is_active());
-
-            Quantity fill_qty = std::min(aggressor.remaining_qty(), resting.remaining_qty());
-            Price    fill_px  = resting.price(); // resting order sets the price
-
-            aggressor.fill(fill_qty);
-            resting.fill(fill_qty);
-
-            lvl->total_qty -= fill_qty;
-
-            Trade t = is_buy
-                ? Trade{ aggressor.id(), resting.id(), fill_px, fill_qty }
-                : Trade{ resting.id(), aggressor.id(), fill_px, fill_qty };
-
-            if (on_trade_) on_trade_(t);
-            trades.push_back(std::move(t));
-
-            // If the resting order is done, pop it.
-            if (!resting.is_active())
-                lvl->orders.pop_front();
-        }
-
-        // Clean up the empty level.
-        if (lvl->empty()) {
-            auto& map = opposite.levels();
-            // const_cast is fine — we own the book.
-            const_cast<std::remove_reference_t<decltype(map)>&>(map)
-                .erase(lvl->price);
-        }
-    }
-
-    return trades;
+    return {
+        .min  = sorted.front(),
+        .p50  = pct(0.50),
+        .p99  = pct(0.99),
+        .p999 = pct(0.999),
+        .max  = sorted.back(),
+    };
 }
 
-std::vector<Trade> OrderBook::add_order(std::unique_ptr<Order> order)
-{
-    if (!order)
-        throw std::invalid_argument("null order");
+// OrderBook constructor
 
+OrderBook::OrderBook(std::string symbol, TradeCallback on_trade, std::size_t pool_size)
+    : symbol_(std::move(symbol))
+    , on_trade_(std::move(on_trade))
+    , pool_(pool_size)
+    , index_(pool_size)
+    , bids_(index_, pool_)
+    , asks_(index_, pool_)
+{}
+
+
+// Internal helpers
+
+Trade OrderBook::make_trade(Order& buy, Order& sell, Price px, Quantity qty)
+{
+    ++trade_seq_;
+    Trade t{
+        .buy_order_id  = buy.id,
+        .sell_order_id = sell.id,
+        .price         = px,
+        .quantity      = qty,
+        .trade_seq     = trade_seq_,
+        .ts            = std::chrono::steady_clock::now(),
+    };
+    if (on_trade_) on_trade_(t);
+    return t;
+}
+
+// Core matching engine
+// Price-time priority.
+
+std::vector<Trade> OrderBook::match(Order& aggressor, bool simulate_only)
+{
     std::vector<Trade> trades;
 
-    // Market orders must find liquidity immediately; if the book is dry after
-    // matching we just let the remaining quantity die — no resting market orders.
-    if (order->type() == OrderType::Market) {
-        trades = match(*order);
-        return trades;   // intentionally not resting leftover market qty
-    }
+    const bool is_buy = aggressor.side == Side::Buy;
 
-    // Limit order: match first, then rest any unfilled remainder.
-    trades = match(*order);
+    // Determine whether two prices cross.
+    auto prices_cross = [&](Price resting_px) noexcept -> bool {
+        if (aggressor.type == OrderType::Market) return true;
+        return is_buy ? (aggressor.price >= resting_px)
+                      : (aggressor.price <= resting_px);
+    };
 
-    if (order->is_active()) {
-        if (order->side() == Side::Buy)
-            bids_.add(std::move(order));
-        else
-            asks_.add(std::move(order));
-    }
+    // We template the inner loop to avoid a branch per iteration and to let the compiler see the exact LevelMap type.
+    auto run = [&](auto& side_book) {
+        auto& level_map = side_book.levels();
+
+        while (aggressor.is_active() && !level_map.empty()) {
+            auto level_it   = level_map.begin();
+            PriceLevel& lvl = level_it->second;
+
+            if (!prices_cross(lvl.price)) break;
+
+            while (aggressor.is_active() && !lvl.empty()) {
+                Order* resting = lvl.front();
+                assert(resting && resting->is_active());
+
+                Quantity fill_qty = std::min(aggressor.remaining_qty,
+                                             resting->remaining_qty);
+                Price    fill_px  = resting->price;
+
+                if (!simulate_only) {
+                    aggressor.fill(fill_qty);
+                    resting->fill(fill_qty);
+                    lvl.total_qty -= fill_qty;
+
+                    Order& buy_o  = is_buy ? aggressor : *resting;
+                    Order& sell_o = is_buy ? *resting  : aggressor;
+                    trades.push_back(make_trade(buy_o, sell_o, fill_px, fill_qty));
+
+                    if (!resting->is_active()) {
+                        index_.erase(resting->id);
+                        lvl.unlink(resting);
+                        pool_.deallocate(resting);
+                    }
+                } else {
+                    aggressor.remaining_qty -= fill_qty;
+                }
+            }
+
+            if (lvl.empty())
+                level_map.erase(level_it);
+        }
+    };
+
+    if (is_buy)  run(asks_);
+    else         run(bids_);
 
     return trades;
 }
 
+// add_order ,  the public entry point
+
+std::vector<Trade> OrderBook::add_order(OrderId   id,
+                                         Price     price,
+                                         Quantity  qty,
+                                         Side      side,
+                                         OrderType type,
+                                         TIF       tif)
+{
+    if (qty == 0)
+        throw std::invalid_argument("order quantity must be > 0");
+
+    // Record when this order entered the engine for latency tracking.
+    const auto t0 = std::chrono::steady_clock::now();
+
+    ++seq_;  // Assign sequence number before anything else.
+
+    // FOK pre-check
+    
+    if (tif == TIF::FOK && type == OrderType::Limit) {
+        // Temporarily create a probe order on the stack — not pool-allocated.
+        Order probe(id, price, qty, side, type, tif, seq_);
+        match(probe, /*simulate_only=*/true);
+        if (probe.remaining_qty > 0) {
+            // Cannot fill fully — reject without touching the book.
+            const auto t1 = std::chrono::steady_clock::now();
+            stats_.record(t1 - t0);
+            return {};  // Empty trades vector signals rejection to the caller.
+        }
+    }
+
+    // Allocate the real order from the pool
+    // We must allocate before matching so the Order object lives in stable
+   
+    Order* o = pool_.allocate(id, price, qty, side, type, tif, seq_);
+
+    // Match
+    std::vector<Trade> trades = match(*o, /*simulate_only=*/false);
+
+    // Post-match TIF handling 
+    if (!o->is_active()) {
+        // Fully filled , free the slot immediately (will not rest in book).
+        pool_.deallocate(o);
+    } else if (type == OrderType::Market || tif == TIF::IOC || tif == TIF::FOK) {
+        // Market / IOC / FOK: cancel whatever's left — never rest in book.
+        o->cancel();
+        pool_.deallocate(o);
+    } else {
+        // GTC Limit: rest the unfilled remainder in the correct side.
+        auto rest = [&](auto& side_book) {
+            auto& lvl_map = side_book.levels();
+            auto [it, inserted] = lvl_map.try_emplace(price);
+            if (inserted) it->second.price = price;
+            PriceLevel& lvl = it->second;
+            lvl.push_back(o);
+            index_.insert(id, &lvl, o);
+        };
+
+        if (side == Side::Buy) rest(bids_);
+        else                   rest(asks_);
+    }
+
+    // Latency accounting
+    const auto t1 = std::chrono::steady_clock::now();
+    stats_.record(t1 - t0);
+
+    return trades;
+}
+
+// cancel_order
 bool OrderBook::cancel_order(OrderId id)
 {
-    // Try bids first, then asks.  Only one side will have it.
-    return bids_.cancel(id) || asks_.cancel(id);
+    // The OrderIndex tells us which side the order is on in O(1).
+    Locator* loc = index_.find(id);
+    if (!loc) return false;
+
+    // Dispatch to the correct side.
+    // The Order itself stores its Side so we can route in one branch.
+    if (loc->order->side == Side::Buy)
+        return bids_.cancel(id);
+    else
+        return asks_.cancel(id);
 }
 
 // Queries
-
 std::optional<Price> OrderBook::best_bid() const
 {
-    if (bids_.empty()) return std::nullopt;
-    return bids_.best_price();
+    return bids_.empty() ? std::nullopt
+                         : std::optional<Price>{bids_.best_price()};
 }
 
 std::optional<Price> OrderBook::best_ask() const
 {
-    if (asks_.empty()) return std::nullopt;
-    return asks_.best_price();
+    return asks_.empty() ? std::nullopt
+                         : std::optional<Price>{asks_.best_price()};
 }
 
 std::optional<Price> OrderBook::mid_price() const
@@ -197,7 +227,7 @@ std::optional<Price> OrderBook::mid_price() const
     auto bid = best_bid();
     auto ask = best_ask();
     if (!bid || !ask) return std::nullopt;
-    return (*bid + *ask) / 2.0;
+    return (*bid + *ask) / 2;   // Integer arithmetic — no FP rounding.
 }
 
 std::optional<Price> OrderBook::spread() const
@@ -226,21 +256,33 @@ void OrderBook::print_top(std::size_t levels) const
     auto bids = bid_depth(levels);
 
     std::cout << "\n=== " << symbol_ << " ===\n";
-    std::cout << std::setw(12) << "PRICE"
-              << std::setw(12) << "QTY"
+    std::cout << std::setw(14) << "PRICE"
+              << std::setw(14) << "QTY"
+              << std::setw(14) << "ORDERS"
               << "\n";
 
-    // Print asks top-down (highest ask first for readability).
+    // Print asks top-down (highest ask first).
     for (auto it = asks.rbegin(); it != asks.rend(); ++it)
-        std::cout << "  ASK " << std::setw(10) << it->first
-                  << std::setw(10) << it->second << "\n";
+        std::cout << "  ASK"
+                  << std::setw(14) << it->first
+                  << std::setw(14) << it->second
+                  << "\n";
 
     if (auto sp = spread())
-        std::cout << "  --- spread " << *sp << " ---\n";
+        std::cout << "   spread " << *sp << " ticks \n";
 
     for (auto& [p, q] : bids)
-        std::cout << "  BID " << std::setw(10) << p
-                  << std::setw(10) << q << "\n";
+        std::cout << "  BID"
+                  << std::setw(14) << p
+                  << std::setw(14) << q
+                  << "\n";
 
-    std::cout << std::endl;
+    auto perc = stats_.compute();
+    std::cout << "\nLatency (ns) | orders=" << order_count()
+              << " trades=" << trade_count() << "\n"
+              << "  min=" << perc.min
+              << " p50=" << perc.p50
+              << " p99=" << perc.p99
+              << " p999=" << perc.p999
+              << " max=" << perc.max << "\n\n";
 }
