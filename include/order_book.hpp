@@ -1,104 +1,419 @@
 #pragma once
 
-#include "order.hpp"
-
-#include <map>
-#include <list>
-#include <vector>
-#include <memory>
-#include <unordered_map>
-#include <optional>
+#include <array>
+#include <cassert>
+#include <chrono>
+#include <cstdint>
 #include <functional>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-// PriceLevel
-// One row in the book — all orders resting at the same price, in FIFO order.
-// We keep a raw total so the engine never has to walk the queue for depth data.
 
-struct PriceLevel {
-    Price                         price;
-    Quantity                      total_qty { 0 };
-    std::list<std::unique_ptr<Order>> orders;
+// Primitive types
 
-    // Convenience: front of the queue is always the oldest resting order.
-    Order* front() const { return orders.empty() ? nullptr : orders.front().get(); }
-    bool   empty() const { return orders.empty(); }
+/// Prices are stored as integer ticks (e.g. 1 tick = $0.00000001).
+/// Avoids floating-point comparison and is idiomatic in real exchanges.
+using Price    = std::int64_t;
+using Quantity = std::uint64_t;
+using OrderId  = std::uint64_t;
+using SeqNum   = std::uint64_t;
+
+// Sentinel representing
+inline constexpr Price MARKET_PRICE = std::numeric_limits<Price>::max();
+
+enum class Side      : std::uint8_t { Buy, Sell };
+enum class OrderType : std::uint8_t { Limit, Market };
+enum class TIF       : std::uint8_t {
+    GTC,   ///< Good Till Cancelled  — rests in book
+    IOC,   ///< Immediate Or Cancel  — cancel unfilled remainder immediately
+    FOK,   ///< Fill Or Kill         — reject entirely if can't fill fully
+};
+enum class OrderStatus : std::uint8_t {
+    New, PartiallyFilled, Filled, Cancelled, Rejected
 };
 
-// BookSide
-//
-// One half of the book (all bids or all asks).
-//
-// Bids  → sorted descending  (highest price first — best bid at top)
-// Asks  → sorted ascending   (lowest  price first — best ask at top)
-//
-// Comparator is a template param so we get one compiled type per side
-// with zero virtual dispatch.
+
+// Pool Allocator  (slab-style, fixed-size objects, cache-line aligned)
+
+// Alignment is 64 bytes (one cache line) to avoid false sharing.
+
+template <typename T, std::size_t N = 1 << 20>
+class PoolAllocator {
+public:
+    static_assert(sizeof(T) >= sizeof(void*), "T must be at least pointer-sized");
+
+    explicit PoolAllocator(std::size_t capacity = N) : capacity_(capacity) {
+        // Lazy: reserve memory but don't touch pages until first alloc.
+        // slab_ grows on demand; free_list_ only has indices of returned slots.
+        slab_.reserve(std::min(capacity, N));
+        free_list_.reserve(256);  // Small initial reservation , grows as needed.
+    }
+
+    template <typename... Args>
+    T* allocate(Args&&... args) {
+        if (!free_list_.empty()) {
+            std::size_t idx = free_list_.back();
+            free_list_.pop_back();
+            return new (&slab_[idx]) T(std::forward<Args>(args)...);
+        }
+        if (slab_.size() >= capacity_) [[unlikely]]
+            throw std::bad_alloc{};
+        slab_.emplace_back();  // Extend slab by one Storage slot.
+        std::size_t idx = slab_.size() - 1;
+        return new (&slab_[idx]) T(std::forward<Args>(args)...);
+    }
+
+    void deallocate(T* p) noexcept {
+        if (!p) return;
+        p->~T();
+        std::size_t idx = static_cast<std::size_t>(
+            reinterpret_cast<Storage*>(p) - slab_.data());
+        free_list_.push_back(idx);
+    }
+
+    std::size_t capacity()  const noexcept { return capacity_; }
+    std::size_t available() const noexcept {
+        return capacity_ - slab_.size() + free_list_.size();
+    }
+
+private:
+    struct alignas(64) Storage { std::byte data[sizeof(T)]; };
+
+    std::size_t              capacity_;
+    std::vector<Storage>     slab_;
+    std::vector<std::size_t> free_list_;
+};
+
+
+// Order
+
+struct Order {
+    // Intrusive doubly-linked list pointers (used by PriceLevel).
+    Order* prev{nullptr};
+    Order* next{nullptr};
+
+    OrderId    id;
+    Price      price;
+    Quantity   orig_qty;
+    Quantity   remaining_qty;
+    Side       side;
+    OrderType  type;
+    TIF        tif;
+    SeqNum     seq;           ///< Monotonically increasing determines time priority.
+    OrderStatus status{OrderStatus::New};
+
+    // Timestamps for latency accounting.
+    std::chrono::steady_clock::time_point submit_ts;
+    std::chrono::steady_clock::time_point first_fill_ts{};
+
+    Order() = default;
+    Order(OrderId id_, Price price_, Quantity qty_, Side side_,
+          OrderType type_, TIF tif_, SeqNum seq_)
+        : id(id_), price(price_), orig_qty(qty_), remaining_qty(qty_)
+        , side(side_), type(type_), tif(tif_), seq(seq_)
+        , submit_ts(std::chrono::steady_clock::now())
+    {}
+
+    [[nodiscard]] bool is_active()  const noexcept {
+        return status == OrderStatus::New || status == OrderStatus::PartiallyFilled;
+    }
+    [[nodiscard]] bool is_filled()  const noexcept { return remaining_qty == 0; }
+
+    void fill(Quantity qty) noexcept {
+        assert(qty <= remaining_qty);
+        if (status == OrderStatus::New)
+            first_fill_ts = std::chrono::steady_clock::now();
+        remaining_qty -= qty;
+        status = (remaining_qty == 0) ? OrderStatus::Filled
+                                      : OrderStatus::PartiallyFilled;
+    }
+    void cancel()  noexcept { status = OrderStatus::Cancelled; }
+    void reject()  noexcept { status = OrderStatus::Rejected;  }
+};
+
+// Trade (execution report)
+
+struct Trade {
+    OrderId  buy_order_id;
+    OrderId  sell_order_id;
+    Price    price;
+    Quantity quantity;
+    SeqNum   trade_seq;  ///< Global trade sequence, needed for audit trail.
+    std::chrono::steady_clock::time_point ts;
+};
+
+using TradeCallback = std::function<void(const Trade&)>;
+
+
+// PriceLevel , intrusive doubly-linked list of Orders at one price
+struct PriceLevel {
+    Price    price{0};
+    Quantity total_qty{0};
+    Order*   head{nullptr};   ///< Oldest (highest priority) order.
+    Order*   tail{nullptr};   ///< Newest order.
+    std::size_t order_count{0};
+
+    [[nodiscard]] bool empty() const noexcept { return head == nullptr; }
+
+    /// Append to tail (time-priority: newer orders go to back).
+    void push_back(Order* o) noexcept {
+        o->prev = tail;
+        o->next = nullptr;
+        if (tail) tail->next = o;
+        else      head = o;
+        tail = o;
+        ++order_count;
+        total_qty += o->remaining_qty;
+    }
+
+    /// Unlink an arbitrary node — O(1).
+    void unlink(Order* o) noexcept {
+        if (o->prev) o->prev->next = o->next;
+        else         head = o->next;
+        if (o->next) o->next->prev = o->prev;
+        else         tail = o->prev;
+        o->prev = o->next = nullptr;
+        --order_count;
+    }
+
+    Order* front() noexcept { return head; }
+    void   pop_front() noexcept { if (head) unlink(head); }
+};
+
+// OrderIndex , O(1) amortised lookup: OrderId → (PriceLevel*, Order*)
+
+struct Locator {
+    PriceLevel* level{nullptr};
+    Order*      order{nullptr};
+};
+
+// Reserve enough buckets up front to keep load factor low and avoid rehash
+// during a benchmark run.
+class OrderIndex {
+public:
+    explicit OrderIndex(std::size_t expected_orders = 1 << 20) {
+        map_.reserve(expected_orders);
+    }
+
+    void insert(OrderId id, PriceLevel* lvl, Order* o) {
+        map_.emplace(id, Locator{lvl, o});
+    }
+
+    [[nodiscard]] Locator* find(OrderId id) {
+        auto it = map_.find(id);
+        return (it == map_.end()) ? nullptr : &it->second;
+    }
+
+    void erase(OrderId id) { map_.erase(id); }
+
+    [[nodiscard]] std::size_t size() const noexcept { return map_.size(); }
+
+private:
+    std::unordered_map<OrderId, Locator> map_;
+};
+
+// BookSide , one side of the order book (bids or asks)
 
 template <typename Comp>
 class BookSide {
 public:
     using LevelMap = std::map<Price, PriceLevel, Comp>;
 
-    void     add(std::unique_ptr<Order> order);
-    bool     cancel(OrderId id);
+    explicit BookSide(OrderIndex& index, PoolAllocator<Order>& pool)
+        : index_(index), pool_(pool)
+    {}
 
-    // Returns nullptr if the side is empty.
-    PriceLevel*       best()       { return levels_.empty() ? nullptr : &levels_.begin()->second; }
-    const PriceLevel* best() const { return levels_.empty() ? nullptr : &levels_.begin()->second; }
+    // Mutating operations
 
-    bool  empty()       const { return levels_.empty(); }
-    Price best_price()  const { return levels_.empty() ? Price{0} : levels_.begin()->first; }
+    Order* add(OrderId id, Price px, Quantity qty, Side side,
+               OrderType type, TIF tif, SeqNum seq);
 
-    // Snapshot of (price → total_qty) for the top N levels — used for depth feeds.
+    bool   cancel(OrderId id);
+
+    // Non-mutating queries
+
+    [[nodiscard]] bool        empty()      const noexcept { return levels_.empty(); }
+    [[nodiscard]] PriceLevel* best()       noexcept;
+    [[nodiscard]] Price       best_price() const;
+
+    [[nodiscard]]
     std::vector<std::pair<Price, Quantity>> depth(std::size_t n) const;
 
-    const LevelMap& levels() const { return levels_; }
+    // Non-const level map access for the matching engine.
+    LevelMap& levels() noexcept { return levels_; }
+    const LevelMap& levels() const noexcept { return levels_; }
+
+    // Allow OrderBook direct access to levels for the matching loop.
+    friend class OrderBook;
 
 private:
-    LevelMap levels_;
+    LevelMap              levels_;
+    OrderIndex&           index_;   // shared across both sides
+    PoolAllocator<Order>& pool_;
+};
 
-    // Fast lookup: order id → iterator into the level's list.
-    // Lets cancel() run in O(1) rather than walking the book.
-    struct Locator {
-        typename LevelMap::iterator                        level_it;
-        typename std::list<std::unique_ptr<Order>>::iterator order_it;
-    };
-    std::unordered_map<OrderId, Locator> index_;
+// Latency statistics (lock-free ring buffer of nanosecond samples)
+
+struct LatencyStats {
+    static constexpr std::size_t kBuckets = 1 << 14;  // 16 384 samples
+
+    std::array<std::uint64_t, kBuckets> samples{};
+    std::size_t write_pos{0};
+    std::size_t count{0};
+
+    void record(std::chrono::nanoseconds ns) noexcept {
+        samples[write_pos & (kBuckets - 1)] =
+            static_cast<std::uint64_t>(ns.count());
+        ++write_pos;
+        if (count < kBuckets) ++count;
+    }
+
+    /// Returns {min, p50, p99, p999, max} in nanoseconds.
+    /// Sorts a copy — call only offline (not on the hot path).
+    struct Percentiles { std::uint64_t min, p50, p99, p999, max; };
+    [[nodiscard]] Percentiles compute() const;
 };
 
 // OrderBook
 
 class OrderBook {
 public:
-    using TradeCallback = std::function<void(const Trade&)>;
+    explicit OrderBook(std::string symbol,
+                       TradeCallback on_trade   = nullptr,
+                       std::size_t   pool_size  = 1 << 20);
 
-    explicit OrderBook(std::string symbol, TradeCallback on_trade = nullptr);
+    // Lifecycle
 
-    // Returns all trades generated (could be many for a market order).
-    std::vector<Trade> add_order(std::unique_ptr<Order> order);
-    bool               cancel_order(OrderId id);
+    /**
+     * Submit a new order.
+     * Returns the list of trades generated.
+     * FOK: returns empty vector + rejects the order if it can't fill fully.
+     * IOC: fills what it can, cancels the rest (never rests in book).
+     * GTC: fills what it can, rests remainder.
+     */
+    std::vector<Trade> add_order(OrderId   id,
+                                  Price     price,
+                                  Quantity  qty,
+                                  Side      side,
+                                  OrderType type = OrderType::Limit,
+                                  TIF       tif  = TIF::GTC);
 
-    // Best prices — nullopt when that side is empty.
-    std::optional<Price> best_bid() const;
-    std::optional<Price> best_ask() const;
-    std::optional<Price> mid_price() const;
-    std::optional<Price> spread()    const;
+   
+    bool cancel_order(OrderId id);
 
-    // Top-N depth on each side.
-    std::vector<std::pair<Price, Quantity>> bid_depth(std::size_t n = 5) const;
-    std::vector<std::pair<Price, Quantity>> ask_depth(std::size_t n = 5) const;
+    // Queries
 
-    const std::string& symbol() const { return symbol_; }
+    [[nodiscard]] std::optional<Price> best_bid()  const;
+    [[nodiscard]] std::optional<Price> best_ask()  const;
+    [[nodiscard]] std::optional<Price> mid_price() const;
+    [[nodiscard]] std::optional<Price> spread()    const;
 
+    [[nodiscard]]
+    std::vector<std::pair<Price, Quantity>> bid_depth(std::size_t n = 10) const;
+    [[nodiscard]]
+    std::vector<std::pair<Price, Quantity>> ask_depth(std::size_t n = 10) const;
+
+    [[nodiscard]] std::uint64_t order_count()  const noexcept { return seq_; }
+    [[nodiscard]] std::uint64_t trade_count()  const noexcept { return trade_seq_; }
+    [[nodiscard]] const LatencyStats& latency_stats() const noexcept { return stats_; }
+
+    // Debug 
     void print_top(std::size_t levels = 5) const;
 
 private:
-    std::string symbol_;
-    TradeCallback on_trade_;
+    // Core matching loop.  Returns filled trades.
+    // simulate_only=true: counts potential fills without committing (for FOK check).
+    std::vector<Trade> match(Order& aggressor, bool simulate_only = false);
 
-    // Bids: descending price.  Asks: ascending price.
-    BookSide<std::greater<Price>> bids_;
-    BookSide<std::less<Price>>    asks_;
+    // Convenience: make a Trade struct and fire the callback.
+    Trade make_trade(Order& buy, Order& sell, Price px, Quantity qty);
 
-    std::vector<Trade> match(Order& aggressor);
+    std::string                  symbol_;
+    TradeCallback                on_trade_;
+
+    PoolAllocator<Order>         pool_;
+    OrderIndex                   index_;
+
+    BookSide<std::greater<Price>> bids_;   // Descending → best bid = begin()
+    BookSide<std::less<Price>>    asks_;   // Ascending  → best ask = begin()
+
+    SeqNum   seq_{0};        ///< Increments per accepted order.
+    SeqNum   trade_seq_{0};  ///< Increments per trade.
+
+    LatencyStats stats_;
 };
+
+// BookSide method implementations (inline in header — template requirement)
+
+template <typename Comp>
+Order* BookSide<Comp>::add(OrderId id, Price px, Quantity qty, Side side,
+                            OrderType type, TIF tif, SeqNum seq)
+{
+    Order* o = pool_.allocate(id, px, qty, side, type, tif, seq);
+
+    auto [it, inserted] = levels_.try_emplace(px);
+    if (inserted) it->second.price = px;
+
+    PriceLevel& lvl = it->second;
+    lvl.push_back(o);
+
+    index_.insert(id, &lvl, o);
+    return o;
+}
+
+template <typename Comp>
+bool BookSide<Comp>::cancel(OrderId id)
+{
+    Locator* loc = index_.find(id);
+    if (!loc) return false;
+
+    Order*      o   = loc->order;
+    PriceLevel* lvl = loc->level;
+
+    if (!o->is_active()) {
+        index_.erase(id);
+        return false;
+    }
+
+    lvl->total_qty -= o->remaining_qty;
+    o->cancel();
+    lvl->unlink(o);
+    pool_.deallocate(o);
+
+    if (lvl->empty())
+        levels_.erase(lvl->price);
+
+    index_.erase(id);
+    return true;
+}
+
+template <typename Comp>
+PriceLevel* BookSide<Comp>::best() noexcept
+{
+    if (levels_.empty()) return nullptr;
+    return &levels_.begin()->second;
+}
+
+template <typename Comp>
+Price BookSide<Comp>::best_price() const
+{
+    assert(!levels_.empty());
+    return levels_.begin()->second.price;
+}
+
+template <typename Comp>
+std::vector<std::pair<Price, Quantity>> BookSide<Comp>::depth(std::size_t n) const
+{
+    std::vector<std::pair<Price, Quantity>> out;
+    out.reserve(n);
+    for (auto& [px, lvl] : levels_) {
+        if (out.size() == n) break;
+        out.emplace_back(px, lvl.total_qty);
+    }
+    return out;
+}
