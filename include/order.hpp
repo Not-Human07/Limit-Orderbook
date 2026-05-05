@@ -32,9 +32,9 @@ inline double price_to_double(Price p) noexcept {
 /// Sentinel price for market orders — guaranteed to cross any limit price.
 inline constexpr Price MARKET_PRICE = std::numeric_limits<Price>::max();
 
-// ──────────────────────────────────────────────────────────────────────────────
+
 // Enumerations
-// ──────────────────────────────────────────────────────────────────────────────
+
 
 enum class Side : std::uint8_t {
     Buy,
@@ -89,11 +89,11 @@ struct Order {
     TIF         tif{TIF::GTC};
     OrderStatus status{OrderStatus::New};
 
-    // ── Timestamps ───────────────────────────────────────────────────────────
+    //  Timestamps 
     TimePoint submit_ts{};       ///< When the order entered the engine.
     TimePoint first_fill_ts{};   ///< When the first fill occurred (zero if unfilled).
 
-    // ── Construction ─────────────────────────────────────────────────────────
+    //  Construction
 
     Order() = default;
 
@@ -180,7 +180,7 @@ struct Trade {
     OrderId   sell_order_id{0};
     Price     price{0};
     Quantity  quantity{0};       ///< Named `quantity`, not `qty`, for clarity.
-    SeqNum    trade_seq{0};      ///< Global trade sequence — audit trail.
+    SeqNum    trade_seq{0};      ///< Global trade sequence , audit trail.
     TimePoint ts{};              ///< When the match occurred.
 
     // Accessors (compatible with matching_engine.cpp call sites)
