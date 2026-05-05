@@ -1,113 +1,65 @@
 #include "order.hpp"
 
-#include <stdexcept>
 #include <sstream>
+#include <iomanip>
 
-//Order
-
-Order::Order(OrderId     id,
-             Side        side,
-             OrderType   type,
-             Price       price,
-             Quantity    qty,
-             std::string trader_id)
-    : id_(id)
-    , side_(side)
-    , type_(type)
-    , price_(price)
-    , initial_qty_(qty)
-    , remaining_qty_(qty)
-    , filled_qty_(0)
-    , status_(OrderStatus::New)
-    , trader_id_(std::move(trader_id))
-    , timestamp_(Clock::now())
-{
-    if (qty == 0)
-        throw std::invalid_argument("Order quantity must be > 0");
-
-    // Market orders don't have a meaningful price; everything else must be positive.
-    if (type_ != OrderType::Market && price_ <= 0)
-        throw std::invalid_argument("Limit order price must be > 0");
-}
-
-// Fills the order with the given quantity, returning how much was filled.
-Quantity Order::fill(Quantity qty)
-{
-    if (qty == 0)
-        return 0;
-
-    Quantity can_fill = std::min(qty, remaining_qty_);
-
-    filled_qty_    += can_fill;
-    remaining_qty_ -= can_fill;
-
-    status_ = (remaining_qty_ == 0) ? OrderStatus::Filled
-                                     : OrderStatus::PartiallyFilled;
-    return can_fill;
-}
-
-void Order::cancel()
-{
-    if (status_ == OrderStatus::Filled)
-        throw std::logic_error("Cannot cancel an already-filled order");
-
-    status_        = OrderStatus::Cancelled;
-    remaining_qty_ = 0;
-}
-
-bool Order::is_active() const noexcept
-{
-    return status_ == OrderStatus::New ||
-           status_ == OrderStatus::PartiallyFilled;
-}
+// Order::to_string
+// For diagnostics and debug printing only — never called in the hot path.
+// Uses price_to_double() for human-readable output while keeping all
+// internal arithmetic in integer ticks.
 
 std::string Order::to_string() const
 {
     std::ostringstream oss;
 
-    oss << "[Order " << id_
-        << " | " << (side_ == Side::Buy ? "BUY" : "SELL")
-        << " | " << (type_ == OrderType::Limit ? "LIMIT" : "MARKET")
-        << " | price=" << price_
-        << " | qty=" << initial_qty_
-        << " | filled=" << filled_qty_
-        << " | remaining=" << remaining_qty_
-        << " | trader=" << trader_id_
+    oss << "[Order " << id
+        << " | seq="    << seq
+        << " | "        << (side == Side::Buy ? "BUY" : "SELL")
+        << " | "        << (type == OrderType::Limit ? "LIMIT" : "MARKET");
+
+    // TIF
+    oss << " | ";
+    switch (tif) {
+        case TIF::GTC: oss << "GTC"; break;
+        case TIF::IOC: oss << "IOC"; break;
+        case TIF::FOK: oss << "FOK"; break;
+    }
+
+    // Price — display as decimal, store as integer ticks.
+    if (type == OrderType::Market)
+        oss << " | price=MARKET";
+    else
+        oss << " | price=" << std::fixed << std::setprecision(4)
+            << price_to_double(price);
+
+    oss << " | orig_qty="      << orig_qty
+        << " | filled="        << filled_qty
+        << " | remaining="     << remaining_qty
         << " | status=";
 
-    switch (status_) {
-        case OrderStatus::New:              oss << "NEW";              break;
-        case OrderStatus::PartiallyFilled:  oss << "PARTIAL";          break;
-        case OrderStatus::Filled:           oss << "FILLED";           break;
-        case OrderStatus::Cancelled:        oss << "CANCELLED";        break;
-        default:                            oss << "UNKNOWN";          break;
+    switch (status) {
+        case OrderStatus::New:             oss << "NEW";     break;
+        case OrderStatus::PartiallyFilled: oss << "PARTIAL"; break;
+        case OrderStatus::Filled:          oss << "FILLED";  break;
+        case OrderStatus::Cancelled:       oss << "CANCELLED"; break;
+        case OrderStatus::Rejected:        oss << "REJECTED";  break;
     }
 
     oss << "]";
     return oss.str();
 }
 
-//Trade
-
-Trade::Trade(OrderId  buy_order_id,
-             OrderId  sell_order_id,
-             Price    price,
-             Quantity qty)
-    : buy_order_id_(buy_order_id)
-    , sell_order_id_(sell_order_id)
-    , price_(price)
-    , qty_(qty)
-    , timestamp_(Clock::now())
-{}
-
+// Trade::to_string
 std::string Trade::to_string() const
 {
     std::ostringstream oss;
     oss << "[Trade"
-        << " buy="  << buy_order_id_
-        << " sell=" << sell_order_id_
-        << " price=" << price_
-        << " qty="   << qty_
+        << " #"      << trade_seq
+        << " buy="   << buy_order_id
+        << " sell="  << sell_order_id
+        << " price=" << std::fixed << std::setprecision(4)
+                     << price_to_double(price)
+        << " qty="   << quantity
         << "]";
     return oss.str();
 }
