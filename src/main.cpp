@@ -7,10 +7,8 @@
 #include <string>
 #include <vector>
 
-// ============================================================================
-// Display helpers
-// ============================================================================
 
+// Display helpers
 // Horizontal rule for section separation.
 static void section(const std::string& title)
 {
@@ -51,12 +49,9 @@ static void print_result(const std::string& label, const OrderResult& r)
     }
 }
 
-// ============================================================================
 // Scenario 1 — Basic limit match (price-time priority)
-//
 // Two bids rest at different prices.  A crossing sell aggresses and should
 // match the better-priced (102.00) bid first.
-// ============================================================================
 static void demo_basic_limit_match(MatchingEngine& eng)
 {
     section("1. Basic limit match — price-time priority");
@@ -103,11 +98,9 @@ static void demo_partial_fill(MatchingEngine& eng)
     eng.print_book(sym, 5);
 }
 
-// ============================================================================
+
 // Scenario 3 — Cancellation
-//
 // Place an order, cancel it, then verify a second cancel returns false.
-// ============================================================================
 static void demo_cancel(MatchingEngine& eng)
 {
     section("3. Cancellation — single and double-cancel");
@@ -129,12 +122,9 @@ static void demo_cancel(MatchingEngine& eng)
     eng.print_book(sym, 5);
 }
 
-// ============================================================================
 // Scenario 4 — Market order sweeps multiple price levels
-//
 // Build an ask ladder at three levels then sweep with a market buy that
 // exhausts two levels fully and partially fills the third.
-// ============================================================================
 static void demo_market_sweep(MatchingEngine& eng)
 {
     section("4. Market order sweeping multiple price levels");
@@ -155,9 +145,7 @@ static void demo_market_sweep(MatchingEngine& eng)
     eng.print_book(sym, 5);
 }
 
-// ============================================================================
 // Scenario 5 — IOC: fills what it can, cancels remainder immediately
-// ============================================================================
 static void demo_ioc(MatchingEngine& eng)
 {
     section("5. IOC — immediate-or-cancel partial fill");
@@ -174,9 +162,7 @@ static void demo_ioc(MatchingEngine& eng)
     eng.print_book(sym, 5);
 }
 
-// ============================================================================
 // Scenario 6 — FOK: reject if can't fill entirely
-// ============================================================================
 static void demo_fok(MatchingEngine& eng)
 {
     section("6. FOK — fill-or-kill, reject on insufficient liquidity");
@@ -196,9 +182,7 @@ static void demo_fok(MatchingEngine& eng)
     print_result("BUY  FOK   215.00 x5 ", r_fill);
 }
 
-// ============================================================================
 // Scenario 7 — Unknown symbol rejection
-// ============================================================================
 static void demo_reject_unknown(MatchingEngine& eng)
 {
     section("7. Reject — unregistered symbol");
@@ -207,12 +191,10 @@ static void demo_reject_unknown(MatchingEngine& eng)
     print_result("BUY  LIMIT  50.00 x1 ", r);
 }
 
-// ============================================================================
 // Scenario 8 — Multi-level depth snapshot
-//
 // Build a realistic order book with multiple levels on each side and
 // print the depth ladder.
-// ============================================================================
+
 static void demo_depth_snapshot(MatchingEngine& eng)
 {
     section("8. Depth snapshot — multi-level book");
@@ -246,13 +228,11 @@ static void demo_depth_snapshot(MatchingEngine& eng)
         std::cout << "  mid_price = " << price_to_double(*mp) << "\n";
 }
 
-// ============================================================================
 // Benchmark — throughput and latency
-//
 // Isolated engine with no I/O callbacks.  Alternates resting bids and
 // aggressive sells to force matching on every other order, which stresses
 // both the resting path and the matching path equally.
-// ============================================================================
+
 static void run_benchmark(std::uint64_t num_orders = 300'000)
 {
     section("Benchmark — throughput & latency");
@@ -339,10 +319,7 @@ static void run_benchmark(std::uint64_t num_orders = 300'000)
     }
 }
 
-// ============================================================================
 // main
-// ============================================================================
-
 int main()
 {
     std::cout << std::fixed << std::setprecision(4);
@@ -368,7 +345,7 @@ int main()
     eng.add_symbol("TSLA");
     eng.add_symbol("NVDA");
 
-    // ── Demo scenarios ──────────────────────────────────────────────────────
+    // Demo scenarios 
     demo_basic_limit_match(eng);
     demo_partial_fill(eng);
     demo_cancel(eng);
@@ -378,12 +355,10 @@ int main()
     demo_reject_unknown(eng);
     demo_depth_snapshot(eng);
 
-    // ── Summary stats from the demo run ────────────────────────────────────
+    // Summary stats from the demo run 
     std::cout << "\n";
     eng.print_stats();
 
-    // ── Benchmark ──────────────────────────────────────────────────────────
     run_benchmark(300'000);
-
     return 0;
 }
