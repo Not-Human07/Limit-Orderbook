@@ -96,9 +96,8 @@ bool MatchingEngine::has_symbol(const std::string& symbol) const
 }
 
 
-// ============================================================================
+
 // Internal helpers
-// ============================================================================
 
 OrderBook* MatchingEngine::get_book(const std::string& symbol)
 {
