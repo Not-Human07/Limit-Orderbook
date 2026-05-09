@@ -75,12 +75,9 @@ static void demo_basic_limit_match(MatchingEngine& eng)
     eng.print_book(sym, 5);
 }
 
-// ============================================================================
 // Scenario 2 — Partial fill
-//
 // Aggressor wants more than what's available at the crossing level.
 // Remainder rests in the book as a GTC order.
-// ============================================================================
 static void demo_partial_fill(MatchingEngine& eng)
 {
     section("2. Partial fill — aggressor larger than resting liquidity");
