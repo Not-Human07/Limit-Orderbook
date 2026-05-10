@@ -1,41 +1,18 @@
 #pragma once
 
+// order.hpp is the single source of truth for all primitive types,
+// Order, Trade, TradeCallback, enums, MARKET_PRICE, PRICE(), price_to_double().
+// Everything order_book.hpp needs from those is pulled in transitively.
+#include "order.hpp"
+
+// std headers needed by order_book.hpp itself (not already in order.hpp)
 #include <array>
 #include <cassert>
-#include <chrono>
-#include <cstdint>
-#include <functional>
-#include <limits>
 #include <map>
-#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-
-// Primitive types
-
-/// Prices are stored as integer ticks (e.g. 1 tick = $0.00000001).
-/// Avoids floating-point comparison and is idiomatic in real exchanges.
-using Price    = std::int64_t;
-using Quantity = std::uint64_t;
-using OrderId  = std::uint64_t;
-using SeqNum   = std::uint64_t;
-
-// Sentinel representing
-inline constexpr Price MARKET_PRICE = std::numeric_limits<Price>::max();
-
-enum class Side      : std::uint8_t { Buy, Sell };
-enum class OrderType : std::uint8_t { Limit, Market };
-enum class TIF       : std::uint8_t {
-    GTC,   ///< Good Till Cancelled  — rests in book
-    IOC,   ///< Immediate Or Cancel  — cancel unfilled remainder immediately
-    FOK,   ///< Fill Or Kill         — reject entirely if can't fill fully
-};
-enum class OrderStatus : std::uint8_t {
-    New, PartiallyFilled, Filled, Cancelled, Rejected
-};
 
 
 // Pool Allocator  (slab-style, fixed-size objects, cache-line aligned)
@@ -88,66 +65,6 @@ private:
     std::vector<Storage>     slab_;
     std::vector<std::size_t> free_list_;
 };
-
-
-// Order
-
-struct Order {
-    // Intrusive doubly-linked list pointers (used by PriceLevel).
-    Order* prev{nullptr};
-    Order* next{nullptr};
-
-    OrderId    id;
-    Price      price;
-    Quantity   orig_qty;
-    Quantity   remaining_qty;
-    Side       side;
-    OrderType  type;
-    TIF        tif;
-    SeqNum     seq;           ///< Monotonically increasing determines time priority.
-    OrderStatus status{OrderStatus::New};
-
-    // Timestamps for latency accounting.
-    std::chrono::steady_clock::time_point submit_ts;
-    std::chrono::steady_clock::time_point first_fill_ts{};
-
-    Order() = default;
-    Order(OrderId id_, Price price_, Quantity qty_, Side side_,
-          OrderType type_, TIF tif_, SeqNum seq_)
-        : id(id_), price(price_), orig_qty(qty_), remaining_qty(qty_)
-        , side(side_), type(type_), tif(tif_), seq(seq_)
-        , submit_ts(std::chrono::steady_clock::now())
-    {}
-
-    [[nodiscard]] bool is_active()  const noexcept {
-        return status == OrderStatus::New || status == OrderStatus::PartiallyFilled;
-    }
-    [[nodiscard]] bool is_filled()  const noexcept { return remaining_qty == 0; }
-
-    void fill(Quantity qty) noexcept {
-        assert(qty <= remaining_qty);
-        if (status == OrderStatus::New)
-            first_fill_ts = std::chrono::steady_clock::now();
-        remaining_qty -= qty;
-        status = (remaining_qty == 0) ? OrderStatus::Filled
-                                      : OrderStatus::PartiallyFilled;
-    }
-    void cancel()  noexcept { status = OrderStatus::Cancelled; }
-    void reject()  noexcept { status = OrderStatus::Rejected;  }
-};
-
-// Trade (execution report)
-
-struct Trade {
-    OrderId  buy_order_id;
-    OrderId  sell_order_id;
-    Price    price;
-    Quantity quantity;
-    SeqNum   trade_seq;  ///< Global trade sequence, needed for audit trail.
-    std::chrono::steady_clock::time_point ts;
-};
-
-using TradeCallback = std::function<void(const Trade&)>;
 
 
 // PriceLevel , intrusive doubly-linked list of Orders at one price
