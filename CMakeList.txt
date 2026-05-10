@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD          20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS        OFF)   # -std=c++20, not -std=gnu++20
 
-
 # Default to Release if the user didn't specify.
 # Never benchmark a Debug build — numbers are meaningless.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -17,7 +16,6 @@ endif()
 # Compiler flags
 # Release  : -O3 -march=native  — full opt + native ISA (AVX2 on Ryzen 6600H)
 # Debug    : -O0 -g + ASan/UBSan — catches the bugs flagged in the audit
-# ============================================================================
 set(CMAKE_CXX_FLAGS_RELEASE
     "-O3 -march=native -funroll-loops -fno-exceptions -DNDEBUG"
     CACHE STRING "Release flags" FORCE)
