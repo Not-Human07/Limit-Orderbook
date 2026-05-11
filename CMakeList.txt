@@ -45,7 +45,10 @@ target_include_directories(demo PRIVATE include)
 # Mixing -O0 engine code into a benchmark is a common mistake; this prevents it.
 
 add_executable(bench
-    bench/bench_main.cpp
+    benchmarks/bench_main.cpp
+    benchmarks/bench_throughput.cpp
+    benchmarks/bench_cancel.cpp
+    benchmarks/bench_latency.cpp
     ${ENGINE_SOURCES}
 )
 target_include_directories(bench PRIVATE include)
