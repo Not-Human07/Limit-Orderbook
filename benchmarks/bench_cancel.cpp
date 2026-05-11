@@ -2,6 +2,7 @@
 
 #include <numeric>
 #include <vector>
+#include <random>
 
 // bench_cancel
 // Measures the latency of cancel_order in isolation.
