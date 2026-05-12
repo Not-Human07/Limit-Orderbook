@@ -54,7 +54,7 @@ add_executable(benchmarks
 target_include_directories(benchmarks PRIVATE include)
 
 # Force Release flags on the bench target unconditionally.
-target_compile_options(bench PRIVATE
+target_compile_options(benchmarks PRIVATE
     -O3
     -march=native
     -funroll-loops
