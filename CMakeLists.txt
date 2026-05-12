@@ -44,14 +44,14 @@ target_include_directories(demo PRIVATE include)
 # Always compiled with full optimisation regardless of CMAKE_BUILD_TYPE.
 # Mixing -O0 engine code into a benchmark is a common mistake; this prevents it.
 
-add_executable(bench
+add_executable(benchmarks
     benchmarks/bench_main.cpp
     benchmarks/bench_throughput.cpp
     benchmarks/bench_cancel.cpp
     benchmarks/bench_latency.cpp
     ${ENGINE_SOURCES}
 )
-target_include_directories(bench PRIVATE include)
+target_include_directories(benchmarks PRIVATE include)
 
 # Force Release flags on the bench target unconditionally.
 target_compile_options(bench PRIVATE
@@ -68,5 +68,5 @@ message(STATUS "  Project  : ${PROJECT_NAME}")
 message(STATUS "  Compiler : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Standard : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  Type     : ${CMAKE_BUILD_TYPE}")
-message(STATUS "  Targets  : demo, bench")
+message(STATUS "  Targets  : demo, benchmarks")
 message(STATUS "---------------------------------------")
