@@ -82,40 +82,52 @@ std::vector<Trade> OrderBook::match(Order& aggressor, bool simulate_only)
         auto& level_map = side_book.levels();
 
         while (aggressor.is_active() && !level_map.empty()) {
-            auto level_it   = level_map.begin();
-            PriceLevel& lvl = level_it->second;
+            PriceLevel& lvl = level_map[0];   // best price always at front
 
             if (!prices_cross(lvl.price)) break;
 
+            if (simulate_only) {
+                // READ-ONLY walk — never touch real book state
+                Order* cursor = lvl.front();
+                while (aggressor.remaining_qty > 0 && cursor != nullptr) {
+                    Quantity consumed = std::min(aggressor.remaining_qty,
+                                                cursor->remaining_qty);
+                    aggressor.remaining_qty -= consumed;
+                    cursor = cursor->next;  // advance via intrusive pointer
+                }
+                // Move to next price level
+                if (aggressor.remaining_qty > 0)
+                    break; // no more liquidity at crossing prices will help
+                else
+                    break; // aggressor fully simulated
+            }
+
+            // Real match path (simulate_only == false) — unchanged
             while (aggressor.is_active() && !lvl.empty()) {
-                Order* resting = lvl.front();
+                Order* resting   = lvl.front();
                 assert(resting && resting->is_active());
 
                 Quantity fill_qty = std::min(aggressor.remaining_qty,
                                              resting->remaining_qty);
                 Price    fill_px  = resting->price;
 
-                if (!simulate_only) {
-                    aggressor.fill(fill_qty);
-                    resting->fill(fill_qty);
-                    lvl.total_qty -= fill_qty;
+                aggressor.fill(fill_qty);
+                resting->fill(fill_qty);
+                lvl.total_qty -= fill_qty;
 
-                    Order& buy_o  = is_buy ? aggressor : *resting;
-                    Order& sell_o = is_buy ? *resting  : aggressor;
-                    trades.push_back(make_trade(buy_o, sell_o, fill_px, fill_qty));
+                Order& buy_o  = is_buy ? aggressor : *resting;
+                Order& sell_o = is_buy ? *resting  : aggressor;
+                trades.push_back(make_trade(buy_o, sell_o, fill_px, fill_qty));
 
-                    if (!resting->is_active()) {
-                        index_.erase(resting->id);
-                        lvl.unlink(resting);
-                        pool_.deallocate(resting);
-                    }
-                } else {
-                    aggressor.remaining_qty -= fill_qty;
+                if (!resting->is_active()) {
+                    index_.erase(resting->id);
+                    lvl.unlink(resting);
+                    pool_.deallocate(resting);
                 }
             }
 
             if (lvl.empty())
-                level_map.erase(level_it);
+                side_book.erase_level(lvl.price);
         }
     };
 
@@ -175,10 +187,7 @@ std::vector<Trade> OrderBook::add_order(OrderId   id,
     } else {
         // GTC Limit: rest the unfilled remainder in the correct side.
         auto rest = [&](auto& side_book) {
-            auto& lvl_map = side_book.levels();
-            auto [it, inserted] = lvl_map.try_emplace(price);
-            if (inserted) it->second.price = price;
-            PriceLevel& lvl = it->second;
+            PriceLevel& lvl = side_book.find_or_insert(price);
             lvl.push_back(o);
             index_.insert(id, &lvl, o);
         };
