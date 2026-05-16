@@ -19,7 +19,7 @@ if(MSVC)
     set(CMAKE_CXX_FLAGS_DEBUG   "/Od /Zi /RTC1"
         CACHE STRING "Debug flags" FORCE)
 else()
-    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -funroll-loops -fno-exceptions -DNDEBUG"
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -funroll-loops -DNDEBUG"
         CACHE STRING "Release flags" FORCE)
     set(CMAKE_CXX_FLAGS_DEBUG   "-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
         CACHE STRING "Debug flags" FORCE)
@@ -57,7 +57,7 @@ if(MSVC)
     target_link_options(benchmarks PRIVATE /LTCG)
 else()
     target_compile_options(benchmarks PRIVATE
-        -O3 -march=native -funroll-loops -fno-exceptions -DNDEBUG
+        -O3 -march=native -funroll-loops -DNDEBUG
     )
 endif()
 
