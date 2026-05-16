@@ -14,7 +14,7 @@ endif()
 
 # Compiler flags — MSVC vs GCC/Clang
 if(MSVC)
-    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /GL /arch:AVX2 /DNDEBUG /EHs-c-"
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /GL /arch:AVX2 /DNDEBUG"
         CACHE STRING "Release flags" FORCE)
     set(CMAKE_CXX_FLAGS_DEBUG   "/Od /Zi /RTC1"
         CACHE STRING "Debug flags" FORCE)
@@ -52,7 +52,7 @@ target_include_directories(benchmarks PRIVATE include)
 # Force full optimization on benchmarks unconditionally
 if(MSVC)
     target_compile_options(benchmarks PRIVATE
-        /O2 /GL /arch:AVX2 /DNDEBUG /EHs-c-
+        /O2 /GL /arch:AVX2 /DNDEBUG
     )
     target_link_options(benchmarks PRIVATE /LTCG)
 else()
