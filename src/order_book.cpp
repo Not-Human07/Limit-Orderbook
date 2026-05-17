@@ -189,7 +189,7 @@ std::vector<Trade> OrderBook::add_order(OrderId   id,
         auto rest = [&](auto& side_book) {
             PriceLevel& lvl = side_book.find_or_insert(price);
             lvl.push_back(o);
-            index_.insert(id, &lvl, o);
+            index_.insert(id, price, o);
         };
 
         if (side == Side::Buy) rest(bids_);
