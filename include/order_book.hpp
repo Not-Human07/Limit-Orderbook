@@ -101,11 +101,11 @@ struct PriceLevel {
     void   pop_front() noexcept { if (head) unlink(head); }
 };
 
-// OrderIndex , O(1) amortised lookup: OrderId → (PriceLevel*, Order*)
+// OrderIndex , O(1) amortised lookup: OrderId → (Price, Order*)
 
 struct Locator {
-    PriceLevel* level{nullptr};
-    Order*      order{nullptr};
+    Price  level_price{0};   // ← price instead of PriceLevel*
+    Order* order{nullptr};
 };
 
 // Reserve enough buckets up front to keep load factor low and avoid rehash
@@ -116,8 +116,8 @@ public:
         map_.reserve(expected_orders);
     }
 
-    void insert(OrderId id, PriceLevel* lvl, Order* o) {
-        map_.emplace(id, Locator{lvl, o});
+    void insert(OrderId id, Price level_price, Order* o) {
+        map_.emplace(id, Locator{level_price, o});
     }
 
     [[nodiscard]] Locator* find(OrderId id) {
@@ -330,21 +330,29 @@ bool BookSide<IsBid>::cancel(OrderId id)
     Locator* loc = index_.find(id);
     if (!loc) return false;
 
-    Order*      o   = loc->order;
-    PriceLevel* lvl = loc->level;
+    Order* o = loc->order;
+    Price  px = loc->level_price;   // ← safe, just an integer
 
     if (!o->is_active()) {
         index_.erase(id);
         return false;
     }
 
-    lvl->total_qty -= o->remaining_qty;
+    // Look up level fresh — pointer always valid
+    auto it = find_level(px);
+    if (it == levels_.end()) {
+        index_.erase(id);
+        return false;
+    }
+    PriceLevel& lvl = *it;
+
+    lvl.total_qty -= o->remaining_qty;
     o->cancel();
-    lvl->unlink(o);
+    lvl.unlink(o);
     pool_.deallocate(o);
 
-    if (lvl->empty())
-        erase_level(lvl->price);
+    if (lvl.empty())
+        levels_.erase(it);   // ← erase by iterator directly, no second search
 
     index_.erase(id);
     return true;
