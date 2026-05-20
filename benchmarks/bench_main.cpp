@@ -25,28 +25,30 @@ BenchResult bench_latency_fok_fail(std::uint64_t n);
 
 static void print_summary(const std::vector<BenchResult>& results)
 {
-    std::cout << "\n";
-   
-    std::cout << "║                         BENCHMARK SUMMARY                               ║\n";
+    const char* row_sep = "+--------------------------------------------------------------------------+\n";
+    const char* col_sep = "+--------------------------------------------------------------------------+\n";
 
-    std::cout << "║  " << std::left
+    std::cout << "\n";
+    std::cout << row_sep;
+    std::cout << "|                         BENCHMARK SUMMARY                               |\n";
+    std::cout << "|  " << std::left
               << std::setw(38) << "Benchmark"
               << std::setw(14) << "M ops/sec"
               << std::setw(10) << "ns/op"
-              << "  ║\n";
-    std::cout << "╠══════════════════════════════════════════════════════════════════════════╣\n";
+              << "  |\n";
+    std::cout << col_sep;
 
     for (const auto& r : results) {
-        std::cout << "║  " << std::left
+        std::cout << "|  " << std::left
                   << std::setw(38) << r.name
                   << std::fixed << std::setprecision(2)
                   << std::setw(14) << (r.ops_per_sec / 1e6)
                   << std::setprecision(1)
                   << std::setw(10) << r.ns_per_op
-                  << "  ║\n";
+                  << "  |\n";
     }
 
-    std::cout << "╚══════════════════════════════════════════════════════════════════════════╝\n";
+    std::cout << row_sep;
 
     // Latency breakdown for benchmarks that have it.
     bool printed_header = false;
@@ -79,15 +81,15 @@ static void print_summary(const std::vector<BenchResult>& results)
 int main()
 {
     std::cout << "\n";
-    std::cout << "███████████████████████████████████████████████████████\n";
-    std::cout << "  Limit Order Book Engine — Benchmark Suite\n";
+    std::cout << "=======================================================\n";
+    std::cout << "  Limit Order Book Engine -- Benchmark Suite\n";
     std::cout << "  Build: Release  (-O3 -march=native)\n";
-    std::cout << "███████████████████████████████████████████████████████\n";
+    std::cout << "=======================================================\n";
 
     std::vector<BenchResult> all_results;
 
     // Throughput 
-    print_header("1. Throughput — rest + aggressive match alternating");
+    print_header("1. Throughput - rest + aggressive match alternating");
     {
         auto r = bench_throughput(300'000);
         print_result(r);
@@ -95,7 +97,7 @@ int main()
     }
 
     // Cancel 
-    print_header("2. Cancel latency — FIFO, LIFO, scattered");
+    print_header("2. Cancel latency - FIFO, LIFO, scattered");
     {
         auto r1 = bench_cancel(50'000);
         auto r2 = bench_cancel_lifo(50'000);
