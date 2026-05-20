@@ -38,7 +38,7 @@ BenchResult bench_cancel(std::uint64_t n = 50'000)
         eng.cancel_order("C", id);
     const double elapsed = t.elapsed_s();
 
-    BenchResult r = make_result("cancel FIFO (head→tail)", n, elapsed);
+    BenchResult r = make_result("cancel FIFO (head->tail)", n, elapsed);
     return r;
 }
 
@@ -63,7 +63,7 @@ BenchResult bench_cancel_lifo(std::uint64_t n = 50'000)
         eng.cancel_order("C", id);
     const double elapsed = t.elapsed_s();
 
-    BenchResult r = make_result("cancel LIFO (tail→head)", n, elapsed);
+    BenchResult r = make_result("cancel LIFO (tail->head)", n, elapsed);
     return r;
 }
 
