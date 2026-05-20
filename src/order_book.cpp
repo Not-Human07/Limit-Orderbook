@@ -34,13 +34,14 @@ LatencyStats::Percentiles LatencyStats::compute() const
 
 // OrderBook constructor
 
-OrderBook::OrderBook(std::string symbol, TradeCallback on_trade, std::size_t pool_size)
+OrderBook::OrderBook(std::string symbol, TradeCallback on_trade,
+                     std::size_t pool_size, std::size_t level_capacity)
     : symbol_(std::move(symbol))
     , on_trade_(std::move(on_trade))
     , pool_(pool_size)
     , index_(pool_size)
-    , bids_(index_, pool_)
-    , asks_(index_, pool_)
+    , bids_(index_, pool_, level_capacity)
+    , asks_(index_, pool_, level_capacity)
 {}
 
 
@@ -81,26 +82,28 @@ std::vector<Trade> OrderBook::match(Order& aggressor, bool simulate_only)
     auto run = [&](auto& side_book) {
         auto& level_map = side_book.levels();
 
+        if (simulate_only) {
+            for (std::size_t i = 0;
+                 i < level_map.size() && aggressor.remaining_qty > 0;
+                 ++i)
+            {
+                const PriceLevel& lvl = side_book.slab(level_map[i]);
+                if (!prices_cross(lvl.price)) break;
+                Order* cursor = lvl.head;
+                while (cursor != nullptr && aggressor.remaining_qty > 0) {
+                    aggressor.remaining_qty -=
+                        std::min(aggressor.remaining_qty, cursor->remaining_qty);
+                    cursor = cursor->next;
+                }
+            }
+            return;
+        }
+
         while (aggressor.is_active() && !level_map.empty()) {
-            PriceLevel& lvl = level_map[0];   // best price always at front
+            uint16_t top_idx = level_map[0];              // slab index of best level
+            PriceLevel& lvl  = side_book.slab(top_idx);   // direct slab access
 
             if (!prices_cross(lvl.price)) break;
-
-            if (simulate_only) {
-                // READ-ONLY walk — never touch real book state
-                Order* cursor = lvl.front();
-                while (aggressor.remaining_qty > 0 && cursor != nullptr) {
-                    Quantity consumed = std::min(aggressor.remaining_qty,
-                                                cursor->remaining_qty);
-                    aggressor.remaining_qty -= consumed;
-                    cursor = cursor->next;  // advance via intrusive pointer
-                }
-                // Move to next price level
-                if (aggressor.remaining_qty > 0)
-                    break; // no more liquidity at crossing prices will help
-                else
-                    break; // aggressor fully simulated
-            }
 
             // Real match path (simulate_only == false) — unchanged
             while (aggressor.is_active() && !lvl.empty()) {
@@ -126,8 +129,9 @@ std::vector<Trade> OrderBook::match(Order& aggressor, bool simulate_only)
                 }
             }
 
-            if (lvl.empty())
-                side_book.erase_level(lvl.price);
+            if (lvl.empty()) {
+                side_book.erase_level(top_idx);
+            }
         }
     };
 
@@ -187,9 +191,11 @@ std::vector<Trade> OrderBook::add_order(OrderId   id,
     } else {
         // GTC Limit: rest the unfilled remainder in the correct side.
         auto rest = [&](auto& side_book) {
-            PriceLevel& lvl = side_book.find_or_insert(price);
-            lvl.push_back(o);
-            index_.insert(id, price, o);
+            // find_or_insert returns a stable vector index.
+            // levels_[idx] is safe — no reallocation after reserve(level_capacity).
+            const uint16_t idx = side_book.find_or_insert(price);
+            side_book.slab(idx).push_back(o);
+            index_.insert(id, idx, o);
         };
 
         if (side == Side::Buy) rest(bids_);
@@ -267,7 +273,6 @@ void OrderBook::print_top(std::size_t levels) const
     std::cout << "\n=== " << symbol_ << " ===\n";
     std::cout << std::setw(14) << "PRICE"
               << std::setw(14) << "QTY"
-              << std::setw(14) << "ORDERS"
               << "\n";
 
     // Print asks top-down (highest ask first).
