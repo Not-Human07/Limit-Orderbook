@@ -76,9 +76,9 @@ private:
 inline void print_header(const std::string& title)
 {
     std::cout << "\n";
-    std::cout << "╔══════════════════════════════════════════════════╗\n";
-    std::cout << "║  " << std::left << std::setw(47) << title << "║\n";
-    std::cout << "╚══════════════════════════════════════════════════╝\n";
+    std::cout << "+--------------------------------------------------+\n";
+    std::cout << "|  " << std::left << std::setw(47) << title << "|\n";
+    std::cout << "+--------------------------------------------------+\n";
 }
 
 inline void print_result(const BenchResult& r)
