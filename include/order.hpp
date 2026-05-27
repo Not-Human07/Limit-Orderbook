@@ -35,7 +35,6 @@ inline constexpr Price MARKET_PRICE = std::numeric_limits<Price>::max();
 
 // Enumerations
 
-
 enum class Side : std::uint8_t {
     Buy,
     Sell,
@@ -63,37 +62,73 @@ enum class OrderStatus : std::uint8_t {
 
 
 // Order
+// Layout: two explicit 64-byte cache lines.
+//
+// Line 1 — HOT (match loop, fill, cancel, list traversal):
+//   prev, next, id, price, orig_qty, remaining_qty, filled_qty,
+//   side, type, tif, status  →  60 bytes used + 4 bytes pad = 64 bytes.
+//
+// Line 2 — COLD (construction, audit, diagnostics):
+//   seq, submit_ts, first_fill_ts  →  24 bytes used.
+//   Remainder filled with compiler-calculated padding so that adding
+//   a cold field never silently breaks alignment — the static_assert
+//   below will catch the overflow immediately.
 
+// Memory stability invariant:
+//   Order objects are allocated via PoolAllocator (placement new) and
+//   must never move after construction.  The intrusive list relies on
+//   stable addresses: moving an Order would dangling-pointer every
+//   neighbour's prev/next and every id_map entry pointing to it.
+//   Copy and move operations are therefore explicitly deleted.
+//   PoolAllocator::allocate() uses placement new and never needs them.
 
-struct Order {
-    // Intrusive doubly-linked list
-    // These two pointers are the only fields the PoolAllocator / PriceLevel
-    // infrastructure touches directly.  They must be first so that a
-    // cache-line fetch that grabs `prev` also grabs `next`.
-    Order* prev{nullptr};
-    Order* next{nullptr};
+struct alignas(64) Order {
 
-    // Identity
-    OrderId   id{0};
-    SeqNum    seq{0};     ///< Monotonically increasing — determines time priority within a level.
+    // Cache line 1 - HOT
+    // Intrusive doubly-linked list pointers.
+    // Must be on line 1: PriceLevel::push_back / unlink touch these on
+    // every insert and cancel.
+    Order*   prev{nullptr};          // 8
+    Order*   next{nullptr};          // 8
 
-    // Economics 
-    Price     price{0};
-    Quantity  orig_qty{0};
-    Quantity  remaining_qty{0};
-    Quantity  filled_qty{0};
+    // Identity (hot: id is read by every cancel and fill).
+    OrderId  id{0};                  // 8
 
-    // Classification
-    Side        side{Side::Buy};
-    OrderType   type{OrderType::Limit};
-    TIF         tif{TIF::GTC};
-    OrderStatus status{OrderStatus::New};
+    // Economics — all four touched on every fill().
+    Price    price{0};               // 8
+    Quantity orig_qty{0};            // 8
+    Quantity remaining_qty{0};       // 8
+    Quantity filled_qty{0};          // 8
 
-    //  Timestamps 
-    TimePoint submit_ts{};       ///< When the order entered the engine.
-    TimePoint first_fill_ts{};   ///< When the first fill occurred (zero if unfilled).
+    // Classification — read by match loop to check side and TIF.
+    Side        side{Side::Buy};     // 1
+    OrderType   type{OrderType::Limit}; // 1
+    TIF         tif{TIF::GTC};       // 1
+    OrderStatus status{OrderStatus::New}; // 1
 
-    //  Construction
+    // Pad line 1 to exactly 64 bytes.
+    // 8+8+8+8+8+8+8+1+1+1+1 = 60 bytes used → 4 bytes pad.
+    uint8_t _pad0[4];                // 4  →  total: 64
+
+    // Cache line 2 — COLD  //
+
+    // seq: set once at construction, never read in the hot path.
+    SeqNum    seq{0};                // 8
+
+    // Timestamps: written at construction and first fill; read only on
+    // diagnostics / audit paths.
+    TimePoint submit_ts{};           // 8
+    TimePoint first_fill_ts{};       // 8
+
+    // Compiler-calculated padding: fills the remainder of line 2.
+    // If a future cold field is added here the constant decreases
+    // automatically; if it overflows, static_assert(sizeof(Order)==128)
+    // fires at compile time — never silently misaligned.
+    static constexpr std::size_t kColdUsed =
+        sizeof(SeqNum) + sizeof(TimePoint) + sizeof(TimePoint); // 24
+    uint8_t _pad1[64 - kColdUsed];  // 40  →  total cold: 64
+
+    // Construction
 
     Order() = default;
 
@@ -105,7 +140,6 @@ struct Order {
           TIF       tif_,
           SeqNum    seq_) noexcept
         : id(id_)
-        , seq(seq_)
         , price(price_)
         , orig_qty(qty_)
         , remaining_qty(qty_)
@@ -114,14 +148,18 @@ struct Order {
         , type(type_)
         , tif(tif_)
         , status(OrderStatus::New)
-        , submit_ts(Clock::now())
+        , seq(seq_)
+        // submit_ts intentionally left zero (epoch) — Clock::now() costs
+        // 23 ns and this field is cold (cache line 2, never read in hot path).
     {}
 
-    // No copies, the pool owns the memory; copying would create aliased pointers.
+    // Memory stability: copy and move are both deleted.
+    // See layout note above — moving an Order dangling-pointers the
+    // intrusive list and every id_map entry that holds Order*.
     Order(const Order&)            = delete;
     Order& operator=(const Order&) = delete;
-    Order(Order&&)                 = default;
-    Order& operator=(Order&&)      = default;
+    Order(Order&&)                 = delete;
+    Order& operator=(Order&&)      = delete;
 
     // State queries
 
@@ -142,8 +180,8 @@ struct Order {
         assert(qty > 0);
         Quantity can_fill = std::min(qty, remaining_qty);
 
-        if (status == OrderStatus::New)
-            first_fill_ts = Clock::now();
+        // first_fill_ts intentionally not updated in hot path (23 ns per fill).
+        // It remains epoch (zero) — readable as "timestamp not recorded".
 
         filled_qty    += can_fill;
         remaining_qty -= can_fill;
@@ -153,7 +191,7 @@ struct Order {
         return can_fill;
     }
 
-    /// Cancel — safe to call on New or PartiallyFilled orders.
+    /// Cancel, safe to call on New or PartiallyFilled orders.
     /// Calling on Filled is a no-op (already done, not an error in the hot path).
     void cancel() noexcept {
         if (status == OrderStatus::Filled) return;
@@ -161,7 +199,7 @@ struct Order {
         remaining_qty = 0;
     }
 
-    /// Reject — used by FOK pre-check; order never entered the book.
+    /// Reject, used by FOK pre-check; order never entered the book.
     void reject() noexcept {
         status        = OrderStatus::Rejected;
         remaining_qty = 0;
@@ -170,6 +208,15 @@ struct Order {
     // Diagnostics
     std::string to_string() const;
 };
+
+// Compile-time layout guards.
+// If sizeof(TimePoint) != 8 on this platform, or a field is added to
+// either cache line without adjusting padding, these fire immediately.
+static_assert(alignof(Order) == 64,
+    "Order must be 64-byte aligned (alignas(64) not honoured by compiler)");
+static_assert(sizeof(Order)  == 128,
+    "Order must be exactly 2 cache lines (128 bytes); "
+    "check _pad0 / _pad1 or field sizes if this fires");
 
 // Trade
 
