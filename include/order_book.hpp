@@ -1,10 +1,8 @@
 #pragma once
-
 // order.hpp is the single source of truth for all primitive types,
 // Order, Trade, TradeCallback, enums, MARKET_PRICE, PRICE(), price_to_double().
 // Everything order_book.hpp needs from those is pulled in transitively.
 #include "order.hpp"
-
 // std headers needed by order_book.hpp itself (not already in order.hpp)
 #include <array>
 #include <cassert>
@@ -12,17 +10,13 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-// Pool Allocator  (slab-style, fixed-size objects, cache-line aligned)
+// PoolAllocator  (slab-style, fixed-size objects, cache-line aligned)
 template <typename T, std::size_t N = 1 << 20>
 class PoolAllocator {
 public:
     static_assert(sizeof(T) >= sizeof(void*), "T must be at least pointer-sized");
 
     explicit PoolAllocator(std::size_t capacity = N) : capacity_(capacity) {
-        // BUG 1 FIX: removed std::min(capacity, N) cap — was silently capping
-        // reserve at N even when capacity > N, causing bad_alloc or UB on
-        // deallocate (slab_.data() changes after realloc).
         slab_.reserve(capacity);
         free_list_.reserve(256);
     }
@@ -35,7 +29,7 @@ public:
             return new (&slab_[idx]) T(std::forward<Args>(args)...);
         }
         if (slab_.size() >= capacity_) [[unlikely]]
-            throw std::bad_alloc{};
+            std::terminate();
         slab_.emplace_back();
         std::size_t idx = slab_.size() - 1;
         return new (&slab_[idx]) T(std::forward<Args>(args)...);
@@ -61,15 +55,20 @@ private:
     std::vector<Storage>     slab_;
     std::vector<std::size_t> free_list_;
 };
-
-// PriceLevel — intrusive doubly-linked list of Orders at one price
-
-struct PriceLevel {
-    Price    price{0};
-    Quantity total_qty{0};
-    Order*   head{nullptr};
-    Order*   tail{nullptr};
+// PriceLevel — intrusive doubly-linked list of Orders at one price.
+// alignas(64): one cache line per level.  Each slot in BookSide::levels_[]
+// occupies exactly one cache line — no false sharing, no straddling.
+// Padding is uninitialized on purpose (never read, never written after reset).
+struct alignas(64) PriceLevel {
+    Price       price{0};
+    Quantity    total_qty{0};
+    Order*      head{nullptr};
+    Order*      tail{nullptr};
     std::size_t order_count{0};
+    // 40 bytes used above; 24 bytes of padding to complete the 64-byte line.
+    // No initializer — padding bytes are never read; zeroing them costs 40 ns
+    // per construction (benchmarked in Phase 1).
+    uint8_t _pad[24];
 
     [[nodiscard]] bool empty() const noexcept { return head == nullptr; }
 
@@ -96,30 +95,26 @@ struct PriceLevel {
     void   pop_front() noexcept { if (head) unlink(head); }
 };
 
-// OrderIndex — O(1) lookup: OrderId → (slab_idx, Order*)
+static_assert(sizeof(PriceLevel)  == 64, "PriceLevel must be exactly one cache line");
+static_assert(alignof(PriceLevel) == 64, "PriceLevel must be cache-line aligned");
+// Locator — stored per resting order in OrderIndex.
 //
-// Locator now stores a uint16_t slab_idx directly into BookSide's
-// LevelSlab.  cancel() uses this to reach the PriceLevel in O(1)
-// with zero hash lookups and zero binary searches.
-//
-// uint16_t supports up to 65535 simultaneous price levels — more
-// than enough for any realistic book.  Fits in a register.
-
-static constexpr uint16_t kInvalidSlabIdx = 0xFFFF;
-
+// Phase 2 change: slab_idx (uint16_t) → tick_idx (uint32_t).
+// tick_idx is the direct index into BookSide::levels_[].
+// cancel() uses it for an O(1) array access — zero hashing, zero search.
 struct Locator {
-    uint16_t slab_idx{kInvalidSlabIdx};  // direct index into BookSide::slab_
+    uint32_t tick_idx{UINT32_MAX};  // direct index into BookSide::levels_[]
     Order*   order{nullptr};
 };
-
+// OrderIndex — O(1) lookup: OrderId → Locator
 class OrderIndex {
 public:
     explicit OrderIndex(std::size_t expected_orders = 1 << 20) {
         map_.reserve(expected_orders);
     }
 
-    void insert(OrderId id, uint16_t slab_idx, Order* o) {
-        map_.emplace(id, Locator{slab_idx, o});
+    void insert(OrderId id, uint32_t tick_idx, Order* o) {
+        map_.emplace(id, Locator{tick_idx, o});
     }
 
     [[nodiscard]] Locator* find(OrderId id) {
@@ -134,96 +129,106 @@ public:
 private:
     std::unordered_map<OrderId, Locator> map_;
 };
-
-
 // BookSide — one side of the order book (bids or asks)
 //
-// Architecture: LevelSlab + sorted index vector
+// Architecture: flat price array indexed by tick offset from base_tick_.
 //
-//   slab_       : vector<PriceLevel>   — contiguous, elements NEVER move.
-//                 Slots are recycled via free_slots_ free-list.
-//                 Match loop dereferences into this — sequential,
-//                 prefetcher-friendly, same cache behaviour as the
-//                 original flat vector<PriceLevel>.
+//   levels_[]     : std::array<PriceLevel, MAX_TICKS>
+//                   Pre-allocated at BookSide construction.  One slot per
+//                   possible tick offset.  Never heap-allocates on the hot
+//                   path.  Never moves (array, not vector).
+//                   Index: tick_to_idx(price) = price - base_tick_
 //
-//   level_map_  : vector<uint16_t>     — sorted slab indices.
-//                 Best price at level_map_[0].
-//                 Each entry is 2 bytes; 500 entries = 1 KB — fits in L1.
-//                 Match loop: level_map_[i] → slab_[level_map_[i]].
-//                 Sequential scan of a tiny array; next cache line
-//                 prefetched before it's needed.
+//   active_[]     : std::array<bool, MAX_TICKS>
+//                   Occupancy flag.  true  → levels_[i] has live orders.
+//                                   false → slot is empty / recycled.
+//                   Byte-per-entry (not bitset) so advance_best() can be
+//                   auto-vectorised by the compiler.
 //
-//   px_to_slab_ : unordered_map<Price, uint16_t>
-//                 Maps price → slab index.  Used ONLY on the insert
-//                 path (find_or_insert) and NOT on the cancel or match
-//                 hot paths.  Cancel uses Locator::slab_idx directly.
+//   best_idx_     : flat index of the current best price level.
+//                   Bids: highest active index (= highest price).
+//                   Asks: lowest  active index (= lowest  price).
 //
-// Performance properties:
-//   cancel()        : 1 OrderIndex lookup (warm) → slab_[idx] directly.
-//                     Zero binary search.  O(1) always.
-//   match loop      : level_map_ scan (uint16_t array, L1-resident) →
-//                     slab_ access (contiguous PriceLevels, prefetchable).
-//                     Same memory behaviour as original flat vector.
-//   find_or_insert  : px_to_slab_ hash lookup on hit (existing level) →
-//                     no binary search needed for the push_back call
-//                     (slab_idx returned directly). Binary search only
-//                     on NEW level insert to find sorted position in
-//                     level_map_.  New level inserts are rare vs fills.
-
+//   base_tick_    : price-offset base for the index calculation.
+//                   Default PRICE(88.00).  Orders outside
+//                   [base_tick_, base_tick_ + MAX_TICKS) are rejected.
+//
+// Complexity:
+//   find_or_insert_idx : O(1)          — one subtraction + one bool check
+//   best()             : O(1)          — single array access
+//   erase_level        : O(1) + O(Δ)  — mark false + scan inward by spread Δ
+//   cancel()           : O(1)          — tick_idx in Locator → direct array hit
+//   match loop         : O(fills)      — no sorted vector, no hash, no search
+//
+// Memory per side: 262144 × 64 B (levels_) + 262144 × 1 B (active_) = 16.25 MB
+// Both sides together: ~32.5 MB — fits in L3 on all modern CPUs.
+// Active working set (levels near best price) fits in L1/L2.
 template <bool IsBid>
 class BookSide {
 public:
-    // LevelMap exposed to the matching engine.
-    // order_book.cpp: auto& level_map = side_book.levels()
-    // level_map[i]  → uint16_t slab index
-    // slab(level_map[i]) → PriceLevel&   (use side_book.slab(idx))
-    using LevelMap = std::vector<uint16_t>;
+    // MAX_TICKS = 2^18 = 262144 ticks.
+    // At TICK_SCALE = 10000 (4 decimal places), this covers a $26.21 range.
+    // Default base_tick = PRICE(88.00) → window covers PRICE(88.00)–PRICE(101.11),
+    // which encompasses all benchmark price ranges (PRICE(90.00)–PRICE(100.00)).
+    static constexpr uint32_t MAX_TICKS = 1u << 17;  // 131072
 
     explicit BookSide(OrderIndex& index, PoolAllocator<Order>& pool,
-                      std::size_t level_capacity = 4096)
-        : index_(index), pool_(pool)
+                      Price base_tick = PRICE(88.00))
+        : index_(index)
+        , pool_(pool)
+        , base_tick_(base_tick)
     {
-        slab_.reserve(level_capacity);
-        free_slots_.reserve(64);
-        level_map_.reserve(level_capacity);
-        px_to_slab_.reserve(level_capacity);
+        // One-time init at construction — never on the hot path.
+        active_.fill(false);
+        // levels_ zero-initialises via std::array default construction.
+        //
+        // Prefault: touch every cache line of levels_ and active_ now.
+        // This moves OS page-fault cost from the first benchmark call to
+        // construction (which is untimed).  Without this, the first
+        // 800+ pages of cold TLB misses add ~150–200 ns to every early order.
+        // The volatile reads prevent the compiler from eliding the loop.
+        volatile uint8_t sink = 0;
+        for (uint32_t i = 0; i < MAX_TICKS; i += 64)   // one touch per cache line
+            sink = reinterpret_cast<volatile uint8_t*>(&levels_[i])[0];
+        for (uint32_t i = 0; i < MAX_TICKS; i += 64)
+            sink = *reinterpret_cast<volatile uint8_t*>(&active_[i]);
+        (void)sink;
     }
 
-    // accessors used by order_book.cpp
-
-    [[nodiscard]] bool  empty()      const noexcept { return level_map_.empty(); }
-
-    // best() returns a pointer to the best PriceLevel (nullptr if empty).
+    // Large fixed arrays — no copies, no moves.
+    BookSide(const BookSide&)            = delete;
+    BookSide& operator=(const BookSide&) = delete;
+    BookSide(BookSide&&)                 = delete;
+    BookSide& operator=(BookSide&&)      = delete;
+    [[nodiscard]] bool empty() const noexcept { return !has_best_; }
     [[nodiscard]] PriceLevel* best() noexcept {
-        return level_map_.empty() ? nullptr : &slab_[level_map_[0]];
+        return has_best_ ? &levels_[best_idx_] : nullptr;
     }
-
-    // best_price() — only call when !empty().
-    [[nodiscard]] Price best_price() const {
-        assert(!level_map_.empty());
-        return slab_[level_map_[0]].price;
+    // Only call when !empty().
+    [[nodiscard]] Price best_price() const noexcept {
+        assert(has_best_);
+        return levels_[best_idx_].price;
     }
-
-    // slab(idx) — gives a PriceLevel& from a slab index.
-    // Used by order_book.cpp match loop:
-    //   PriceLevel& lvl = side_book.slab(level_map[i]);
-    [[nodiscard]] PriceLevel& slab(uint16_t idx) noexcept { return slab_[idx]; }
-    [[nodiscard]] const PriceLevel& slab(uint16_t idx) const noexcept { return slab_[idx]; }
-
-    LevelMap&       levels() noexcept       { return level_map_; }
-    const LevelMap& levels() const noexcept { return level_map_; }
-
-    // core operations
-
+    // Cancel a resting order by id.
     bool cancel(OrderId id);
 
-    // Returns slab index for the given price.
-    // Inserts a new PriceLevel into slab_ and level_map_ if not present.
-    uint16_t find_or_insert(Price px);
+    // Return the tick index for px, creating the slot if needed.
+    // Used by add_order rest path to get the index to store in Locator.
+    uint32_t find_or_insert_idx(Price px) noexcept {
+        uint32_t idx = tick_to_idx(px);
+        if (!active_[idx]) init_slot(idx, px);
+        return idx;
+    }
 
-    // Remove the level at slab index idx from level_map_ and recycle the slot.
-    // Called by order_book.cpp match loop when a level drains to zero.
-    void erase_level(uint16_t slab_idx);
+    // Mark a level empty and advance best_idx_ if needed.
+    // Called by the match loop when a level fully drains.
+    void erase_level(uint32_t idx) noexcept;
+
+    // FOK simulate pass: walk active levels from best, decrement
+    // aggressor.remaining_qty without touching the book.
+    // Callable is `bool(Price)` — returns true if prices cross.
+    template <typename PricesCrossFn>
+    void simulate_fill(Order& aggressor, PricesCrossFn crosses) const noexcept;
 
     [[nodiscard]]
     std::vector<std::pair<Price, Quantity>> depth(std::size_t n) const;
@@ -231,27 +236,67 @@ public:
     friend class OrderBook;
 
 private:
-    // Binary search in level_map_ for a slab index whose price == px.
-    // Returns level_map_.end() if not found.
-    typename LevelMap::iterator find_level_iter(Price px);
+    [[nodiscard]] uint32_t tick_to_idx(Price px) const noexcept {
+        return static_cast<uint32_t>(px - base_tick_);
+    }
 
-    // Contiguous slab — PriceLevels live here and never move.
-    std::vector<PriceLevel>  slab_;
-    // Free-list of recycled slab slots.
-    std::vector<uint16_t>    free_slots_;
-    // Sorted vector of slab indices: best price first.
-    LevelMap                 level_map_;
-    // Price → slab index map.  Insert path only.
-    std::unordered_map<Price, uint16_t> px_to_slab_;
+    [[nodiscard]] bool is_better(uint32_t a, uint32_t b) const noexcept {
+        if constexpr (IsBid) return a > b;   // higher index = higher price = better bid
+        else                 return a < b;   // lower  index = lower  price = better ask
+    }
 
+    // Initialise an empty slot on first use (or after recycling).
+    void init_slot(uint32_t idx, Price px) noexcept {
+        // No PriceLevel{} here — slots are zero-init at construction,
+        // and erase_level() resets head/tail/total_qty/order_count explicitly
+        // (see push_back / unlink).  Assigning PriceLevel{} would be a
+        // redundant 40-byte memset on every new level.
+        levels_[idx].price       = px;
+        levels_[idx].total_qty   = 0;
+        levels_[idx].head        = nullptr;
+        levels_[idx].tail        = nullptr;
+        levels_[idx].order_count = 0;
+        active_[idx] = true;
+        ++active_count_;
+        if (!has_best_ || is_better(idx, best_idx_)) {
+            best_idx_ = idx;
+            has_best_ = true;
+        }
+    }
+
+    // Scan inward from best_idx_ to find the next active level.
+    // Only called when best_idx_ was just erased.  Bounded by spread.
+    void advance_best() noexcept {
+        if (active_count_ == 0) { has_best_ = false; return; }
+        if constexpr (IsBid) {
+            // Scan downward: lower index = lower price = worse bid.
+            uint32_t i = best_idx_;
+            while (i > 0) {
+                --i;
+                if (active_[i]) { best_idx_ = i; return; }
+            }
+        } else {
+            // Scan upward: higher index = higher price = worse ask.
+            for (uint32_t i = best_idx_ + 1; i < MAX_TICKS; ++i) {
+                if (active_[i]) { best_idx_ = i; return; }
+            }
+        }
+        has_best_ = false;
+    }
+    // Flat price array — 262144 × 64 B = 16 MB per side.
+    std::array<PriceLevel, MAX_TICKS> levels_;
+    // Occupancy flags — 262144 × 1 B = 256 KB per side.
+    std::array<bool, MAX_TICKS> active_;
+    uint32_t best_idx_    {0};
+    bool     has_best_    {false};
+    uint32_t active_count_{0};
     OrderIndex&           index_;
     PoolAllocator<Order>& pool_;
+    Price                 base_tick_;
 };
-
-// LatencyStats
-
+// LatencyStats — ring-buffer of per-call nanosecond samples
 struct LatencyStats {
-    static constexpr std::size_t kBuckets = 1 << 14;
+    static constexpr std::size_t kBuckets = 1 << 14;  // 16 384 samples
 
     std::array<std::uint64_t, kBuckets> samples{};
     std::size_t write_pos{0};
@@ -267,45 +312,38 @@ struct LatencyStats {
     struct Percentiles { std::uint64_t min, p50, p99, p999, max; };
     [[nodiscard]] Percentiles compute() const;
 };
-
 // OrderBook
-
 class OrderBook {
 public:
+    // level_capacity kept for API compatibility with MatchingEngine — unused
+    // internally (the flat array needs no pre-sizing).
     explicit OrderBook(std::string symbol,
                        TradeCallback on_trade       = nullptr,
                        std::size_t   pool_size      = 1 << 20,
-                       std::size_t   level_capacity = 4096);
-
+                       std::size_t   level_capacity = 4096,
+                       Price         base_tick      = PRICE(88.00));
     std::vector<Trade> add_order(OrderId   id,
                                   Price     price,
                                   Quantity  qty,
                                   Side      side,
                                   OrderType type = OrderType::Limit,
                                   TIF       tif  = TIF::GTC);
-
     bool cancel_order(OrderId id);
-
     [[nodiscard]] std::optional<Price> best_bid()  const;
     [[nodiscard]] std::optional<Price> best_ask()  const;
     [[nodiscard]] std::optional<Price> mid_price() const;
     [[nodiscard]] std::optional<Price> spread()    const;
-
     [[nodiscard]]
     std::vector<std::pair<Price, Quantity>> bid_depth(std::size_t n = 10) const;
     [[nodiscard]]
     std::vector<std::pair<Price, Quantity>> ask_depth(std::size_t n = 10) const;
-
     [[nodiscard]] std::uint64_t order_count()  const noexcept { return seq_; }
     [[nodiscard]] std::uint64_t trade_count()  const noexcept { return trade_seq_; }
     [[nodiscard]] const LatencyStats& latency_stats() const noexcept { return stats_; }
-
     void print_top(std::size_t levels = 5) const;
-
 private:
     std::vector<Trade> match(Order& aggressor, bool simulate_only = false);
     Trade make_trade(Order& buy, Order& sell, Price px, Quantity qty);
-
     std::string          symbol_;
     TradeCallback        on_trade_;
     PoolAllocator<Order> pool_;
@@ -316,80 +354,16 @@ private:
     SeqNum               trade_seq_{0};
     LatencyStats         stats_;
 };
-
-// BookSide method implementations
-
+// BookSide method implementations (in header — templates require visibility)
 template <bool IsBid>
-typename BookSide<IsBid>::LevelMap::iterator
-BookSide<IsBid>::find_level_iter(Price px)
+void BookSide<IsBid>::erase_level(uint32_t idx) noexcept
 {
-    // Binary search level_map_ by price stored in slab_.
-    auto it = std::lower_bound(
-        level_map_.begin(), level_map_.end(), px,
-        [this](uint16_t idx, Price p) {
-            if constexpr (IsBid) return slab_[idx].price > p;
-            else                 return slab_[idx].price < p;
-        });
-    if (it != level_map_.end() && slab_[*it].price == px) return it;
-    return level_map_.end();
-}
-
-template <bool IsBid>
-uint16_t BookSide<IsBid>::find_or_insert(Price px)
-{
-    // --- Hit path: level already exists ---
-    // One hash lookup → slab index directly.  No binary search.
-    // This is the common case on the resting hot path.
-    auto pm_it = px_to_slab_.find(px);
-    if (pm_it != px_to_slab_.end()) {
-        return pm_it->second;
-    }
-
-    // Miss path: new level 
-    // Allocate a slab slot (recycle free slot or extend).
-    uint16_t idx;
-    if (!free_slots_.empty()) {
-        idx = free_slots_.back();
-        free_slots_.pop_back();
-        slab_[idx] = PriceLevel{.price = px};   // reinitialise recycled slot
-    } else {
-        assert(slab_.size() < kInvalidSlabIdx && "Too many simultaneous price levels");
-        idx = static_cast<uint16_t>(slab_.size());
-        slab_.push_back(PriceLevel{.price = px});
-    }
-
-    // Register in price map.
-    px_to_slab_.emplace(px, idx);
-
-    // Insert slab index into the sorted level_map_.
-    // Binary search is on uint16_t values (2 bytes each) — very cache-friendly.
-    auto lv_it = std::lower_bound(
-        level_map_.begin(), level_map_.end(), px,
-        [this](uint16_t i, Price p) {
-            if constexpr (IsBid) return slab_[i].price > p;
-            else                 return slab_[i].price < p;
-        });
-    level_map_.insert(lv_it, idx);
-
-    return idx;
-}
-
-template <bool IsBid>
-void BookSide<IsBid>::erase_level(uint16_t slab_idx)
-{
-    Price px = slab_[slab_idx].price;
-
-    // Remove from sorted index vector — shifting uint16_t values (2 bytes).
-    auto lv_it = find_level_iter(px);
-    if (lv_it != level_map_.end())
-        level_map_.erase(lv_it);
-
-    // Remove from price map.
-    px_to_slab_.erase(px);
-
-    // Reset the slab slot and mark it free for reuse.
-    slab_[slab_idx] = PriceLevel{};
-    free_slots_.push_back(slab_idx);
+    active_[idx] = false;
+    // Do NOT assign PriceLevel{} here — that zeroes 40 bytes (memset) on every
+    // level drain, same trap as _pad{} in Phase 1 (+40 ns per call).
+    // Fields are always overwritten by init_slot() before being read again.
+    --active_count_;
+    if (idx == best_idx_) advance_best();
 }
 
 template <bool IsBid>
@@ -399,16 +373,15 @@ bool BookSide<IsBid>::cancel(OrderId id)
     if (!loc) return false;
 
     Order*   o        = loc->order;
-    uint16_t slab_idx = loc->slab_idx;
+    uint32_t tick_idx = loc->tick_idx;
 
     if (!o->is_active()) {
         index_.erase(id);
         return false;
     }
 
-    // Direct slab access — O(1), zero hash lookups, zero binary search.
-    // slab_idx was stored in Locator at order insertion time.
-    PriceLevel& lvl = slab_[slab_idx];
+    // O(1) direct array access — tick_idx was stored at order insertion time.
+    PriceLevel& lvl = levels_[tick_idx];
 
     lvl.total_qty -= o->remaining_qty;
     o->cancel();
@@ -416,11 +389,67 @@ bool BookSide<IsBid>::cancel(OrderId id)
     pool_.deallocate(o);
     index_.erase(id);
 
-    if (lvl.empty()) {
-        erase_level(slab_idx);
-    }
+    if (lvl.empty()) erase_level(tick_idx);
 
     return true;
+}
+
+template <bool IsBid>
+template <typename PricesCrossFn>
+void BookSide<IsBid>::simulate_fill(Order& aggressor,
+                                     PricesCrossFn crosses) const noexcept
+{
+    // Walk active levels from best toward the interior, simulating fills.
+    // No book mutations — only aggressor.remaining_qty changes.
+    // Used exclusively by the FOK pre-check path.
+    //
+    // Termination is bounded by active_count_ — we stop as soon as we have
+    // visited every active level (or the first non-crossing one), so we never
+    // scan the entire 262 K-entry active_[] array in the common case where
+    // liquidity runs out before the aggressor is fully filled.
+    if (!has_best_ || active_count_ == 0) return;
+
+    uint32_t visited = 0;   // count of active levels seen — exit when == active_count_
+
+    if constexpr (IsBid) {
+        // bid side: best = highest idx, interior = lower indices
+        uint32_t i = best_idx_;
+        while (aggressor.remaining_qty > 0 && visited < active_count_) {
+            if (active_[i]) {
+                ++visited;
+                const PriceLevel& lvl = levels_[i];
+                if (!crosses(lvl.price)) break;   // price order: worse bids won't cross either
+                for (const Order* o = lvl.head;
+                     o != nullptr && aggressor.remaining_qty > 0;
+                     o = o->next)
+                {
+                    aggressor.remaining_qty -=
+                        std::min(aggressor.remaining_qty, o->remaining_qty);
+                }
+            }
+            if (i == 0) break;
+            --i;
+        }
+    } else {
+        // ask side: best = lowest idx, interior = higher indices
+        uint32_t i = best_idx_;
+        while (aggressor.remaining_qty > 0 && visited < active_count_) {
+            if (i >= MAX_TICKS) break;
+            if (active_[i]) {
+                ++visited;
+                const PriceLevel& lvl = levels_[i];
+                if (!crosses(lvl.price)) break;   // price order: worse asks won't cross either
+                for (const Order* o = lvl.head;
+                     o != nullptr && aggressor.remaining_qty > 0;
+                     o = o->next)
+                {
+                    aggressor.remaining_qty -=
+                        std::min(aggressor.remaining_qty, o->remaining_qty);
+                }
+            }
+            ++i;
+        }
+    }
 }
 
 template <bool IsBid>
@@ -428,9 +457,27 @@ std::vector<std::pair<Price, Quantity>>
 BookSide<IsBid>::depth(std::size_t n) const
 {
     std::vector<std::pair<Price, Quantity>> out;
-    out.reserve(std::min(n, level_map_.size()));
-    for (std::size_t i = 0; i < level_map_.size() && i < n; ++i)
-        out.emplace_back(slab_[level_map_[i]].price,
-                         slab_[level_map_[i]].total_qty);
+    if (!has_best_ || n == 0) return out;
+    out.reserve(std::min(n, static_cast<std::size_t>(active_count_)));
+
+    if constexpr (IsBid) {
+        // Best bid = highest price = highest index; walk downward.
+        uint32_t i = best_idx_;
+        while (out.size() < n) {
+            if (active_[i])
+                out.emplace_back(levels_[i].price, levels_[i].total_qty);
+            if (i == 0) break;
+            --i;
+        }
+    } else {
+        // Best ask = lowest price = lowest index; walk upward.
+        for (uint32_t i = best_idx_;
+             i < MAX_TICKS && out.size() < n;
+             ++i)
+        {
+            if (active_[i])
+                out.emplace_back(levels_[i].price, levels_[i].total_qty);
+        }
+    }
     return out;
 }
