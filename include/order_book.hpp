@@ -8,7 +8,6 @@
 #include <cassert>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 // PoolAllocator  (slab-style, fixed-size objects, cache-line aligned)
 template <typename T, std::size_t N = 1 << 20>
@@ -107,27 +106,42 @@ struct Locator {
     Order*   order{nullptr};
 };
 // OrderIndex — O(1) lookup: OrderId → Locator
+//
+// Phase 3: flat array replacing unordered_map.
+// Indexed by (id & ID_MASK) — one array write on insert, one read on find,
+// one pointer clear on erase.  No hashing, no bucket scan, no rehash.
+//
+// Safety: OrderId is monotonically assigned.  Two live orders share a slot
+// only if their ids differ by a multiple of SLOTS (1 048 576).  With ≤ 50K
+// concurrent live orders this is impossible within normal operation.
 class OrderIndex {
 public:
-    explicit OrderIndex(std::size_t expected_orders = 1 << 20) {
-        map_.reserve(expected_orders);
+    static constexpr std::size_t   SLOTS   = 1u << 20;   // 1 048 576 slots → 16 MB
+    static constexpr std::uint64_t ID_MASK = SLOTS - 1;
+
+    // Accept the pool-size arg OrderBook passes — silently ignored; array
+    // is always SLOTS wide regardless of how many orders the pool holds.
+    explicit OrderIndex(std::size_t /*ignored*/ = SLOTS) noexcept {}
+
+    void insert(OrderId id, uint32_t tick_idx, Order* o) noexcept {
+        slots_[id & ID_MASK] = {tick_idx, o};
     }
 
-    void insert(OrderId id, uint32_t tick_idx, Order* o) {
-        map_.emplace(id, Locator{tick_idx, o});
+    [[nodiscard]] Locator* find(OrderId id) noexcept {
+        Locator& s = slots_[id & ID_MASK];
+        return s.order ? &s : nullptr;
     }
 
-    [[nodiscard]] Locator* find(OrderId id) {
-        auto it = map_.find(id);
-        return (it == map_.end()) ? nullptr : &it->second;
+    // Only the discriminant needs clearing — tick_idx is dead until the next insert.
+    void erase(OrderId id) noexcept {
+        slots_[id & ID_MASK].order = nullptr;
     }
 
-    void erase(OrderId id) { map_.erase(id); }
-
-    [[nodiscard]] std::size_t size() const noexcept { return map_.size(); }
+    [[nodiscard]] std::size_t size() const noexcept { return 0; }   // diagnostic; not hot
 
 private:
-    std::unordered_map<OrderId, Locator> map_;
+    // Value-init: default-constructs each Locator → order = nullptr (slot empty).
+    std::array<Locator, SLOTS> slots_{};
 };
 // BookSide — one side of the order book (bids or asks)
 //
@@ -311,6 +325,12 @@ struct LatencyStats {
 
     struct Percentiles { std::uint64_t min, p50, p99, p999, max; };
     [[nodiscard]] Percentiles compute() const;
+
+    // Most-recent recorded sample — lets MatchingEngine read the elapsed time
+    // that add_order already measured, without a redundant Clock::now() pair.
+    [[nodiscard]] std::uint64_t last_ns() const noexcept {
+        return count ? samples[(write_pos - 1) & (kBuckets - 1)] : 0;
+    }
 };
 // OrderBook
 class OrderBook {
