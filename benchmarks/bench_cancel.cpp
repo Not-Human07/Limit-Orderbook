@@ -22,20 +22,20 @@ BenchResult bench_cancel(std::uint64_t n = 50'000)
 {
     // Setup: place all orders, collect their ids
     MatchingEngine eng;
-    eng.add_symbol("C");
+    const SymbolId sym = eng.add_symbol("C");
 
     std::vector<OrderId> ids;
     ids.reserve(n);
 
     for (std::uint64_t i = 0; i < n; ++i) {
-        auto r = eng.submit_limit("C", Side::Buy, PRICE(100.00), 1);
+        auto r = eng.submit_limit(sym, Side::Buy, PRICE(100.00), 1);
         ids.push_back(r.order_id);
     }
 
     // Timed: FIFO cancel (head → tail)
     Timer t;
     for (OrderId id : ids)
-        eng.cancel_order("C", id);
+        eng.cancel_order(sym, id);
     const double elapsed = t.elapsed_s();
 
     BenchResult r = make_result("cancel FIFO (head->tail)", n, elapsed);
@@ -45,13 +45,13 @@ BenchResult bench_cancel(std::uint64_t n = 50'000)
 BenchResult bench_cancel_lifo(std::uint64_t n = 50'000)
 {
     MatchingEngine eng;
-    eng.add_symbol("C");
+    const SymbolId sym = eng.add_symbol("C");
 
     std::vector<OrderId> ids;
     ids.reserve(n);
 
     for (std::uint64_t i = 0; i < n; ++i) {
-        auto r = eng.submit_limit("C", Side::Buy, PRICE(100.00), 1);
+        auto r = eng.submit_limit(sym, Side::Buy, PRICE(100.00), 1);
         ids.push_back(r.order_id);
     }
 
@@ -60,7 +60,7 @@ BenchResult bench_cancel_lifo(std::uint64_t n = 50'000)
 
     Timer t;
     for (OrderId id : ids)
-        eng.cancel_order("C", id);
+        eng.cancel_order(sym, id);
     const double elapsed = t.elapsed_s();
 
     BenchResult r = make_result("cancel LIFO (tail->head)", n, elapsed);
@@ -73,7 +73,7 @@ BenchResult bench_cancel_lifo(std::uint64_t n = 50'000)
 BenchResult bench_cancel_scattered(std::uint64_t n = 50'000)
 {
     MatchingEngine eng;
-    eng.add_symbol("C");
+    const SymbolId sym = eng.add_symbol("C");
 
     // Spread across 500 price levels, ~100 orders per level.
     std::mt19937_64 rng(7);
@@ -83,7 +83,7 @@ BenchResult bench_cancel_scattered(std::uint64_t n = 50'000)
     ids.reserve(n);
 
     for (std::uint64_t i = 0; i < n; ++i) {
-        auto r = eng.submit_limit("C", Side::Buy, price_dist(rng), 1);
+        auto r = eng.submit_limit(sym, Side::Buy, price_dist(rng), 1);
         ids.push_back(r.order_id);
     }
 
@@ -92,7 +92,7 @@ BenchResult bench_cancel_scattered(std::uint64_t n = 50'000)
 
     Timer t;
     for (OrderId id : ids)
-        eng.cancel_order("C", id);
+        eng.cancel_order(sym, id);
     const double elapsed = t.elapsed_s();
 
     BenchResult r = make_result("cancel scattered (random price levels)", n, elapsed);
