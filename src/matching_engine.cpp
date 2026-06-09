@@ -7,9 +7,9 @@
 
 
 // EngineStats
+
 std::uint64_t EngineStats::avg_latency_ns() const noexcept
 {
-    // Guard against division by zero on an empty run.
     return (orders_received == 0) ? 0 : (total_latency_ns / orders_received);
 }
 
@@ -35,7 +35,6 @@ void EngineStats::reset() noexcept
 
 void EngineStats::print() const
 {
-    // Called offline only — formatting cost is irrelevant.
     const std::uint64_t avg = avg_latency_ns();
 
     std::cout << "\n=== EngineStats ===\n"
@@ -66,18 +65,22 @@ MatchingEngine::MatchingEngine(EngineTradeCallback  on_trade,
 
 // Symbol registration
 
-void MatchingEngine::add_symbol(const std::string& symbol)
+SymbolId MatchingEngine::add_symbol(const std::string& symbol)
 {
     if (symbol.empty())
         throw std::invalid_argument("symbol must be non-empty");
 
-    // Silently ignore duplicate registrations — idempotent.
-    if (books_.count(symbol)) return;
+    // Idempotent — return existing id on duplicate registration.
+    auto it = symbol_ids_.find(symbol);
+    if (it != symbol_ids_.end()) return it->second;
 
-    // Each OrderBook owns its own pool and index.
-    // The per-book TradeCallback wraps the engine-level callback, prepending
-    // the symbol.  Capturing by value is intentional: the lambda must outlive
-    // any individual add_symbol call.
+    if (next_symbol_id_ >= MAX_SYMBOLS)
+        throw std::runtime_error("symbol table full (max 256 symbols)");
+
+    const SymbolId sid = next_symbol_id_++;
+
+    // Per-book callback wraps the engine-level callback with the symbol name.
+    // Captured by value — lambda must outlive the add_symbol call.
     TradeCallback book_cb = nullptr;
     if (on_trade_) {
         book_cb = [this, symbol](const Trade& t) {
@@ -85,29 +88,38 @@ void MatchingEngine::add_symbol(const std::string& symbol)
         };
     }
 
-    books_.emplace(symbol,
-                   std::make_unique<OrderBook>(symbol, std::move(book_cb)));
+    books_[sid] = std::make_unique<OrderBook>(symbol, std::move(book_cb));
+    symbol_ids_[symbol] = sid;
+    return sid;
 }
 
 bool MatchingEngine::has_symbol(const std::string& symbol) const
 {
-    return books_.count(symbol) != 0;
+    return symbol_ids_.count(symbol) != 0;
 }
 
 
 
 // Internal helpers
 
-OrderBook* MatchingEngine::get_book(const std::string& symbol)
+// O(1): single bounds check + array slot read.  No string work.
+OrderBook* MatchingEngine::get_book(SymbolId sid) noexcept
 {
-    auto it = books_.find(symbol);
-    return (it == books_.end()) ? nullptr : it->second.get();
+    return (sid < MAX_SYMBOLS) ? books_[sid].get() : nullptr;
 }
 
-const OrderBook* MatchingEngine::get_book(const std::string& symbol) const
+const OrderBook* MatchingEngine::get_book(SymbolId sid) const noexcept
 {
-    auto it = books_.find(symbol);
-    return (it == books_.end()) ? nullptr : it->second.get();
+    return (sid < MAX_SYMBOLS) ? books_[sid].get() : nullptr;
+}
+
+// Returns MAX_SYMBOLS as sentinel when symbol is unknown.
+// get_book(MAX_SYMBOLS) returns nullptr, which do_submit handles as rejection.
+// Never called on the hot path.
+SymbolId MatchingEngine::resolve(const std::string& symbol) const noexcept
+{
+    auto it = symbol_ids_.find(symbol);
+    return (it == symbol_ids_.end()) ? MAX_SYMBOLS : it->second;
 }
 
 void MatchingEngine::record_latency(std::uint64_t ns) noexcept
@@ -128,33 +140,26 @@ void MatchingEngine::accumulate_trades(const std::vector<Trade>& trades) noexcep
 
 // do_submit — single internal path for all order types
 //
-// All public submit_* methods funnel here.  This keeps stat accounting,
-// latency measurement, and error handling in exactly one place.
+// All public submit_* methods funnel here.  Stat accounting, latency
+// measurement, and error handling live in exactly one place.
 //
-// Design notes:
-//   - OrderId is assigned here, monotonically, before the book sees it.
-//   - Timing wraps add_order only — symbol lookup is outside the timed region
-//     so the number reflects pure engine latency, not map lookup overhead.
-//   - OrderResult::accepted is derived from the trade vector and order type:
-//       * FOK rejection  → add_order returns empty trades  (book never touched)
-//       * Market/IOC     → accepted=true regardless of fill amount
-//       * GTC partial    → accepted=true, trades may be non-empty
+// Takes SymbolId — all symbol resolution is done by callers.
+// The string path (resolve → SymbolId → do_submit) is off the hot path.
 
-
-OrderResult MatchingEngine::do_submit(const std::string& symbol,
-                                      Side               side,
-                                      Price              price,
-                                      Quantity           qty,
-                                      OrderType          type,
-                                      TIF                tif)
+OrderResult MatchingEngine::do_submit(SymbolId  sid,
+                                      Side      side,
+                                      Price     price,
+                                      Quantity  qty,
+                                      OrderType type,
+                                      TIF       tif)
 {
-    OrderBook* bk = get_book(symbol);
+    // Single array slot read — no string hash, no bucket scan.
+    OrderBook* bk = get_book(sid);
     if (!bk) [[unlikely]] {
-        // Unknown symbol — reject immediately, no id assigned.
         OrderResult r;
-        r.order_id     = 0;
-        r.accepted     = false;
-        r.reject_reason = "unknown symbol: " + symbol;
+        r.order_id      = 0;
+        r.accepted      = false;
+        r.reject_reason = "unknown symbol";
         ++stats_.orders_rejected;
         if (on_reject_) on_reject_(0, r.reject_reason);
         return r;
@@ -163,21 +168,14 @@ OrderResult MatchingEngine::do_submit(const std::string& symbol,
     const OrderId id = next_id_++;
     ++stats_.orders_received;
 
-    // add_order times itself internally and records into book.latency_stats().
-    // Reading last_ns() after the call avoids two redundant Clock::now() calls
-    // (t0 + t1 that used to bracket add_order here) — saves ~23 ns per order.
+    // add_order times itself internally; last_ns() reads that sample back.
+    // Avoids two redundant Clock::now() calls that would bracket add_order here.
     std::vector<Trade> trades = bk->add_order(id, price, qty, side, type, tif);
-
     const std::uint64_t elapsed_ns = bk->latency_stats().last_ns();
 
     record_latency(elapsed_ns);
     accumulate_trades(trades);
 
-    // Determine acceptance.
-    // FOK rejection: tif==FOK && trades empty && order is NOT in the book
-    // (add_order returns {} on FOK reject and the order never rests).
-    // We distinguish FOK rejection from a GTC/IOC that simply had no matches
-    // by checking the tif — an empty trade vector on a non-FOK is still accepted.
     const bool fok_rejected = (tif == TIF::FOK) && trades.empty();
 
     OrderResult result;
@@ -192,12 +190,6 @@ OrderResult MatchingEngine::do_submit(const std::string& symbol,
     } else {
         result.accepted = true;
 
-        // Update fill/partial/resting counters.
-        // We infer final order status from the trade list + tif:
-        //   - If all qty was filled in trades → Filled
-        //   - If some was filled and IOC/Market → also counts as done (cancelled remainder)
-        //   - If some was filled and GTC → PartiallyFilled, resting
-        //   - If no fills and GTC → New, resting (not counted as partial)
         Quantity filled = 0;
         for (const Trade& t : result.trades)
             filled += t.quantity;
@@ -205,10 +197,8 @@ OrderResult MatchingEngine::do_submit(const std::string& symbol,
         if (filled == qty) {
             ++stats_.orders_filled;
         } else if (filled > 0) {
-            // Partial fill.
             ++stats_.orders_partial;
         }
-        // Zero-fill GTC limit that rests fully → no counter update (it's just resting).
     }
 
     return result;
@@ -216,122 +206,193 @@ OrderResult MatchingEngine::do_submit(const std::string& symbol,
 
 
 
-// Public submission API
+// Public submission API — SymbolId overloads (hot path)
+// Single array slot read in do_submit; no string work anywhere.
 
 
-OrderResult MatchingEngine::submit_limit(const std::string& symbol,
-                                         Side               side,
-                                         Price              price,
-                                         Quantity           qty,
-                                         TIF                tif)
+OrderResult MatchingEngine::submit_limit(SymbolId sid, Side side, Price price,
+                                          Quantity qty, TIF tif)
 {
-    if (qty == 0) [[unlikely]]
-        throw std::invalid_argument("order quantity must be > 0");
-    if (price <= 0) [[unlikely]]
-        throw std::invalid_argument("limit price must be > 0");
-
-    return do_submit(symbol, side, price, qty, OrderType::Limit, tif);
+    if (qty == 0)   [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    if (price <= 0) [[unlikely]] throw std::invalid_argument("limit price must be > 0");
+    return do_submit(sid, side, price, qty, OrderType::Limit, tif);
 }
 
-OrderResult MatchingEngine::submit_market(const std::string& symbol,
-                                          Side               side,
-                                          Quantity           qty)
+OrderResult MatchingEngine::submit_market(SymbolId sid, Side side, Quantity qty)
 {
-    if (qty == 0) [[unlikely]]
-        throw std::invalid_argument("order quantity must be > 0");
-
-    // Market orders use MARKET_PRICE sentinel and IOC semantics:
-    // sweep as much liquidity as exists, discard any unfilled remainder.
-    return do_submit(symbol, side, MARKET_PRICE, qty, OrderType::Market, TIF::IOC);
+    if (qty == 0) [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    return do_submit(sid, side, MARKET_PRICE, qty, OrderType::Market, TIF::IOC);
 }
 
-OrderResult MatchingEngine::submit_fok(const std::string& symbol,
-                                       Side               side,
-                                       Price              price,
-                                       Quantity           qty)
+OrderResult MatchingEngine::submit_fok(SymbolId sid, Side side, Price price,
+                                        Quantity qty)
 {
-    if (qty == 0) [[unlikely]]
-        throw std::invalid_argument("order quantity must be > 0");
-    if (price <= 0) [[unlikely]]
-        throw std::invalid_argument("limit price must be > 0");
-
-    return do_submit(symbol, side, price, qty, OrderType::Limit, TIF::FOK);
+    if (qty == 0)   [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    if (price <= 0) [[unlikely]] throw std::invalid_argument("limit price must be > 0");
+    return do_submit(sid, side, price, qty, OrderType::Limit, TIF::FOK);
 }
 
-OrderResult MatchingEngine::submit_ioc(const std::string& symbol,
-                                       Side               side,
-                                       Price              price,
-                                       Quantity           qty)
+OrderResult MatchingEngine::submit_ioc(SymbolId sid, Side side, Price price,
+                                        Quantity qty)
 {
-    if (qty == 0) [[unlikely]]
-        throw std::invalid_argument("order quantity must be > 0");
-    if (price <= 0) [[unlikely]]
-        throw std::invalid_argument("limit price must be > 0");
-
-    return do_submit(symbol, side, price, qty, OrderType::Limit, TIF::IOC);
+    if (qty == 0)   [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    if (price <= 0) [[unlikely]] throw std::invalid_argument("limit price must be > 0");
+    return do_submit(sid, side, price, qty, OrderType::Limit, TIF::IOC);
 }
 
-bool MatchingEngine::cancel_order(const std::string& symbol, OrderId id)
+bool MatchingEngine::cancel_order(SymbolId sid, OrderId id)
 {
-    OrderBook* bk = get_book(symbol);
+    OrderBook* bk = get_book(sid);
     if (!bk) return false;
-
     const bool cancelled = bk->cancel_order(id);
     if (cancelled) ++stats_.orders_cancelled;
     return cancelled;
 }
 
-// Queries
+
+
+// Public submission API — string wrappers (off hot path)
+// Resolve symbol → SymbolId once, then delegate to do_submit.
+
+
+OrderResult MatchingEngine::submit_limit(const std::string& symbol, Side side,
+                                          Price price, Quantity qty, TIF tif)
+{
+    if (qty == 0)   [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    if (price <= 0) [[unlikely]] throw std::invalid_argument("limit price must be > 0");
+    return do_submit(resolve(symbol), side, price, qty, OrderType::Limit, tif);
+}
+
+OrderResult MatchingEngine::submit_market(const std::string& symbol, Side side,
+                                           Quantity qty)
+{
+    if (qty == 0) [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    return do_submit(resolve(symbol), side, MARKET_PRICE, qty, OrderType::Market,
+                     TIF::IOC);
+}
+
+OrderResult MatchingEngine::submit_fok(const std::string& symbol, Side side,
+                                        Price price, Quantity qty)
+{
+    if (qty == 0)   [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    if (price <= 0) [[unlikely]] throw std::invalid_argument("limit price must be > 0");
+    return do_submit(resolve(symbol), side, price, qty, OrderType::Limit, TIF::FOK);
+}
+
+OrderResult MatchingEngine::submit_ioc(const std::string& symbol, Side side,
+                                        Price price, Quantity qty)
+{
+    if (qty == 0)   [[unlikely]] throw std::invalid_argument("order quantity must be > 0");
+    if (price <= 0) [[unlikely]] throw std::invalid_argument("limit price must be > 0");
+    return do_submit(resolve(symbol), side, price, qty, OrderType::Limit, TIF::IOC);
+}
+
+bool MatchingEngine::cancel_order(const std::string& symbol, OrderId id)
+{
+    return cancel_order(resolve(symbol), id);
+}
+
+
+
+// Queries — SymbolId overloads
+
+
+const OrderBook* MatchingEngine::book(SymbolId sid) const
+{
+    return get_book(sid);
+}
+
+std::optional<Price> MatchingEngine::best_bid(SymbolId sid) const
+{
+    const OrderBook* bk = get_book(sid);
+    return bk ? bk->best_bid() : std::nullopt;
+}
+
+std::optional<Price> MatchingEngine::best_ask(SymbolId sid) const
+{
+    const OrderBook* bk = get_book(sid);
+    return bk ? bk->best_ask() : std::nullopt;
+}
+
+std::optional<Price> MatchingEngine::spread(SymbolId sid) const
+{
+    const OrderBook* bk = get_book(sid);
+    return bk ? bk->spread() : std::nullopt;
+}
+
+std::optional<Price> MatchingEngine::mid_price(SymbolId sid) const
+{
+    const OrderBook* bk = get_book(sid);
+    return bk ? bk->mid_price() : std::nullopt;
+}
+
+std::vector<std::pair<Price, Quantity>>
+MatchingEngine::bid_depth(SymbolId sid, std::size_t levels) const
+{
+    const OrderBook* bk = get_book(sid);
+    return bk ? bk->bid_depth(levels) : std::vector<std::pair<Price, Quantity>>{};
+}
+
+std::vector<std::pair<Price, Quantity>>
+MatchingEngine::ask_depth(SymbolId sid, std::size_t levels) const
+{
+    const OrderBook* bk = get_book(sid);
+    return bk ? bk->ask_depth(levels) : std::vector<std::pair<Price, Quantity>>{};
+}
+
+void MatchingEngine::print_book(SymbolId sid, std::size_t levels) const
+{
+    const OrderBook* bk = get_book(sid);
+    if (!bk) {
+        std::cout << "[MatchingEngine] unknown symbol id\n";
+        return;
+    }
+    bk->print_top(levels);
+}
+
+
+
+// Queries — string wrappers
+
 
 const OrderBook* MatchingEngine::book(const std::string& symbol) const
 {
-    return get_book(symbol);
+    return book(resolve(symbol));
 }
 
 std::optional<Price> MatchingEngine::best_bid(const std::string& symbol) const
 {
-    const OrderBook* bk = get_book(symbol);
-    return bk ? bk->best_bid() : std::nullopt;
+    return best_bid(resolve(symbol));
 }
 
 std::optional<Price> MatchingEngine::best_ask(const std::string& symbol) const
 {
-    const OrderBook* bk = get_book(symbol);
-    return bk ? bk->best_ask() : std::nullopt;
+    return best_ask(resolve(symbol));
 }
 
 std::optional<Price> MatchingEngine::spread(const std::string& symbol) const
 {
-    const OrderBook* bk = get_book(symbol);
-    return bk ? bk->spread() : std::nullopt;
+    return spread(resolve(symbol));
 }
 
 std::optional<Price> MatchingEngine::mid_price(const std::string& symbol) const
 {
-    const OrderBook* bk = get_book(symbol);
-    return bk ? bk->mid_price() : std::nullopt;
+    return mid_price(resolve(symbol));
 }
 
 std::vector<std::pair<Price, Quantity>>
 MatchingEngine::bid_depth(const std::string& symbol, std::size_t levels) const
 {
-    const OrderBook* bk = get_book(symbol);
-    return bk ? bk->bid_depth(levels) : std::vector<std::pair<Price, Quantity>>{};
+    return bid_depth(resolve(symbol), levels);
 }
 
 std::vector<std::pair<Price, Quantity>>
 MatchingEngine::ask_depth(const std::string& symbol, std::size_t levels) const
 {
-    const OrderBook* bk = get_book(symbol);
-    return bk ? bk->ask_depth(levels) : std::vector<std::pair<Price, Quantity>>{};
+    return ask_depth(resolve(symbol), levels);
 }
 
 void MatchingEngine::print_book(const std::string& symbol, std::size_t levels) const
 {
-    const OrderBook* bk = get_book(symbol);
-    if (!bk) {
-        std::cout << "[MatchingEngine] unknown symbol: " << symbol << "\n";
-        return;
-    }
-    bk->print_top(levels);
+    print_book(resolve(symbol), levels);
 }
