@@ -1,6 +1,7 @@
 #include "bench_utils.hpp"
 
 #include <random>
+
 // bench_throughput
 // Measures raw order submission throughput under matching pressure.
 // Pattern: alternating rest / aggress
@@ -14,7 +15,7 @@
 BenchResult bench_throughput(std::uint64_t n = 300'000)
 {
     MatchingEngine eng;
-    eng.add_symbol("T");
+    const SymbolId sym = eng.add_symbol("T");
 
     std::mt19937_64 rng(42);
     std::uniform_int_distribution<Quantity> qty_dist(1, 100);
@@ -25,7 +26,7 @@ BenchResult bench_throughput(std::uint64_t n = 300'000)
     const std::uint64_t warmup = n / 10;
     for (std::uint64_t i = 0; i < warmup; ++i) {
         Side s = (i % 2 == 0) ? Side::Buy : Side::Sell;
-        eng.submit_limit("T", s, PRICE(100.00), 1);
+        eng.submit_limit(sym, s, PRICE(100.00), 1);
     }
     eng.reset_stats();
 
@@ -33,16 +34,16 @@ BenchResult bench_throughput(std::uint64_t n = 300'000)
     Timer t;
     for (std::uint64_t i = 0; i < n; ++i) {
         if (i % 2 == 0)
-            eng.submit_limit("T", Side::Buy,  PRICE(100.00), qty_dist(rng));
+            eng.submit_limit(sym, Side::Buy,  PRICE(100.00), qty_dist(rng));
         else
-            eng.submit_limit("T", Side::Sell, PRICE(100.00), qty_dist(rng));
+            eng.submit_limit(sym, Side::Sell, PRICE(100.00), qty_dist(rng));
     }
     const double elapsed = t.elapsed_s();
 
     // Latency percentiles from book ring buffer
     BenchResult r = make_result("throughput (rest+match alternating)", n, elapsed);
 
-    if (const OrderBook* bk = eng.book("T")) {
+    if (const OrderBook* bk = eng.book(sym)) {
         auto p       = bk->latency_stats().compute();
         r.lat_min    = p.min;
         r.lat_p50    = p.p50;
