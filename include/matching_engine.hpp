@@ -8,7 +8,7 @@
 
 #include "order_book.hpp"   // transitively pulls in order.hpp
 
-#include <chrono>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -18,18 +18,27 @@
 #include <vector>
 
 
+// SymbolId
+// Lightweight integer handle returned by add_symbol().
+// Store at setup time and pass to the SymbolId overloads of submit_*,
+// cancel_order, and queries.  Replaces the string hash + bucket lookup
+// that fires on every order in the string overloads.
+
+using SymbolId = std::uint16_t;
+
+
 // EngineStats
 // Accumulated counters since engine start (or last reset()).
 // Plain values — single-threaded contract, no atomics needed.
 
 struct EngineStats {
     std::uint64_t orders_received  { 0 };
-    std::uint64_t orders_filled    { 0 };   //< Fully filled.
-    std::uint64_t orders_partial   { 0 };   //< Resting with at least one fill.
+    std::uint64_t orders_filled    { 0 };   ///< Fully filled.
+    std::uint64_t orders_partial   { 0 };   ///< Resting with at least one fill.
     std::uint64_t orders_cancelled { 0 };
-    std::uint64_t orders_rejected  { 0 };   //< FOK rejections.
+    std::uint64_t orders_rejected  { 0 };   ///< FOK rejections.
     std::uint64_t trades_executed  { 0 };
-    Quantity       total_volume    { 0 };   //< Total quantity traded (both sides).
+    Quantity       total_volume    { 0 };   ///< Total quantity traded (both sides).
 
     // Latency in nanoseconds (wall-clock, per add_order call).
     std::uint64_t total_latency_ns { 0 };
@@ -40,8 +49,8 @@ struct EngineStats {
     [[nodiscard]] std::uint64_t avg_latency_ns() const noexcept;
     [[nodiscard]] double        orders_per_second(double elapsed_seconds) const noexcept;
 
-    void reset()  noexcept;
-    void print()  const;
+    void reset() noexcept;
+    void print() const;
 };
 
 
@@ -55,8 +64,8 @@ struct EngineStats {
 struct OrderResult {
     OrderId            order_id    { 0 };
     bool               accepted    { false };
-    std::string        reject_reason;          //< Non-empty iff accepted == false.
-    std::vector<Trade> trades;                 //< Immediate fills, if any.
+    std::string        reject_reason;          ///< Non-empty iff accepted == false.
+    std::vector<Trade> trades;                 ///< Immediate fills, if any.
 };
 
 
@@ -64,9 +73,6 @@ struct OrderResult {
 // Distinct from the per-book TradeCallback (order.hpp) which carries only
 // the Trade.  The engine-level callback adds the symbol so upstream consumers
 // can route without a separate lookup.
-//
-// Named differently to avoid any collision with the TradeCallback alias
-// already defined in order.hpp.
 
 using EngineTradeCallback  = std::function<void(const std::string& symbol,
                                                  const Trade&)>;
@@ -80,64 +86,60 @@ class MatchingEngine {
 public:
     explicit MatchingEngine(EngineTradeCallback  on_trade  = nullptr,
                             EngineRejectCallback on_reject = nullptr);
+
     // Symbol registration
     // Must be called before any orders for that symbol are submitted.
-      void add_symbol(const std::string& symbol);
+    // Returns a SymbolId — store it and pass it to the SymbolId overloads
+    // of submit_*, cancel_order, and queries to eliminate string work on
+    // every hot-path call.
+    SymbolId add_symbol(const std::string& symbol);
     [[nodiscard]] bool has_symbol(const std::string& symbol) const;
 
-    // Order submission
-    // Submit a GTC limit order.
-    // Returns an OrderResult with the generated id and any immediate fills.
-    OrderResult submit_limit(const std::string& symbol,
-                             Side               side,
-                             Price              price,
-                             Quantity           qty,
-                             TIF                tif = TIF::GTC);
+    // Hot-path overloads (SymbolId)
+    // Single array slot read — no string hash, no bucket scan.
 
-    /// Submit a market order (sweeps the book; never rests).
-    /// tif is always IOC semantics for market orders — remainder is dropped.
-    OrderResult submit_market(const std::string& symbol,
-                              Side               side,
-                              Quantity           qty);
+    OrderResult submit_limit (SymbolId sid, Side side, Price price, Quantity qty,
+                              TIF tif = TIF::GTC);
+    OrderResult submit_market(SymbolId sid, Side side, Quantity qty);
+    OrderResult submit_fok   (SymbolId sid, Side side, Price price, Quantity qty);
+    OrderResult submit_ioc   (SymbolId sid, Side side, Price price, Quantity qty);
+    bool        cancel_order (SymbolId sid, OrderId id);
 
-    /// Submit a FOK limit order.
-    /// Convenience wrapper — equivalent to submit_limit with tif=TIF::FOK.
-    OrderResult submit_fok(const std::string& symbol,
-                           Side               side,
-                           Price              price,
-                           Quantity           qty);
+    // String wrappers
+    // Resolve symbol → SymbolId once, then delegate.  Never on the hot path.
 
-    /// Submit an IOC limit order.
-    /// Convenience wrapper — equivalent to submit_limit with tif=TIF::IOC.
-    OrderResult submit_ioc(const std::string& symbol,
-                           Side               side,
-                           Price              price,
-                           Quantity           qty);
+    OrderResult submit_limit (const std::string& symbol, Side side, Price price,
+                              Quantity qty, TIF tif = TIF::GTC);
+    OrderResult submit_market(const std::string& symbol, Side side, Quantity qty);
+    OrderResult submit_fok   (const std::string& symbol, Side side, Price price,
+                              Quantity qty);
+    OrderResult submit_ioc   (const std::string& symbol, Side side, Price price,
+                              Quantity qty);
+    bool        cancel_order (const std::string& symbol, OrderId id);
 
-    /// Cancel a resting order by id.
-    /// Returns false if not found or already terminal (filled / cancelled).
-    bool cancel_order(const std::string& symbol, OrderId id);
+    // Queries (SymbolId)
+    [[nodiscard]] const OrderBook* book(SymbolId sid) const;
+    [[nodiscard]] std::optional<Price> best_bid (SymbolId sid) const;
+    [[nodiscard]] std::optional<Price> best_ask (SymbolId sid) const;
+    [[nodiscard]] std::optional<Price> spread   (SymbolId sid) const;
+    [[nodiscard]] std::optional<Price> mid_price(SymbolId sid) const;
+    [[nodiscard]] std::vector<std::pair<Price, Quantity>>
+        bid_depth(SymbolId sid, std::size_t levels = 10) const;
+    [[nodiscard]] std::vector<std::pair<Price, Quantity>>
+        ask_depth(SymbolId sid, std::size_t levels = 10) const;
+    void print_book(SymbolId sid, std::size_t levels = 5) const;
 
-    
-    // Queries (non-mutating)
-   
-
-    /// Raw access to the underlying OrderBook for a symbol.
-    /// Returns nullptr if the symbol is not registered.
+    // Queries (string)
     [[nodiscard]] const OrderBook* book(const std::string& symbol) const;
-
-    [[nodiscard]] std::optional<Price> best_bid(const std::string& symbol) const;
-    [[nodiscard]] std::optional<Price> best_ask(const std::string& symbol) const;
+    [[nodiscard]] std::optional<Price> best_bid (const std::string& symbol) const;
+    [[nodiscard]] std::optional<Price> best_ask (const std::string& symbol) const;
     [[nodiscard]] std::optional<Price> spread   (const std::string& symbol) const;
     [[nodiscard]] std::optional<Price> mid_price(const std::string& symbol) const;
-
-    [[nodiscard]]
-    std::vector<std::pair<Price, Quantity>>
-    bid_depth(const std::string& symbol, std::size_t levels = 10) const;
-
-    [[nodiscard]]
-    std::vector<std::pair<Price, Quantity>>
-    ask_depth(const std::string& symbol, std::size_t levels = 10) const;
+    [[nodiscard]] std::vector<std::pair<Price, Quantity>>
+        bid_depth(const std::string& symbol, std::size_t levels = 10) const;
+    [[nodiscard]] std::vector<std::pair<Price, Quantity>>
+        ask_depth(const std::string& symbol, std::size_t levels = 10) const;
+    void print_book(const std::string& symbol, std::size_t levels = 5) const;
 
     // Stats & diagnostics
 
@@ -145,39 +147,41 @@ public:
     void reset_stats() noexcept { stats_.reset(); }
     void print_stats() const    { stats_.print(); }
 
-    // Delegates to OrderBook::print_top for the given symbol.
-    void print_book(const std::string& symbol, std::size_t levels = 5) const;
-
 private:
-   // Internal helpers
-   
-    //Core dispatch, both submit_limit and submit_market funnel here.
-    /// "price"    : pass MARKET_PRICE for market orders.
-    /// "type"    : Limit or Market.
-    /// "tif"      : GTC / IOC / FOK.
-    OrderResult do_submit(const std::string& symbol,
-                          Side               side,
-                          Price              price,
-                          Quantity           qty,
-                          OrderType          type,
-                          TIF                tif);
+    // Maximum symbols supported.  256 × 8 bytes = 2 KB — fits in L1.
+    static constexpr SymbolId MAX_SYMBOLS = 256;
 
-    // Returns a mutable pointer to the book, or nullptr.
-    OrderBook*       get_book(const std::string& symbol);
-    const OrderBook* get_book(const std::string& symbol) const;
+    // Single internal submit path — SymbolId only, no string work.
+    OrderResult do_submit(SymbolId  sid,
+                          Side      side,
+                          Price     price,
+                          Quantity  qty,
+                          OrderType type,
+                          TIF       tif);
 
-    // Update latency stats after a single add_order call.
-    void record_latency(std::uint64_t ns) noexcept;
+    // O(1) book lookup by id.  Returns nullptr for out-of-range / unknown sid.
+    OrderBook*       get_book(SymbolId sid)       noexcept;
+    const OrderBook* get_book(SymbolId sid) const noexcept;
 
-    // Walk the trade vector and update stats_.
+    // String → SymbolId.  Returns MAX_SYMBOLS (sentinel) if symbol unknown.
+    // Never called on the hot path.
+    SymbolId resolve(const std::string& symbol) const noexcept;
+
+    void record_latency   (std::uint64_t ns) noexcept;
     void accumulate_trades(const std::vector<Trade>& trades) noexcept;
 
     // Members
-    // Monotonically increasing order id — plain integer, single-threaded.
-    OrderId next_id_ { 1 };
 
-    // One OrderBook per registered symbol.
-    std::unordered_map<std::string, std::unique_ptr<OrderBook>> books_;
+    OrderId  next_id_        { 1 };
+    SymbolId next_symbol_id_ { 0 };
+
+    // Direct-indexed book array — O(1) lookup, no hash, no heap chase.
+    // 256 × sizeof(unique_ptr) = 2 KB, fits in L1.
+    std::array<std::unique_ptr<OrderBook>, MAX_SYMBOLS> books_{};
+
+    // String → SymbolId mapping.  Touched only at add_symbol time, never
+    // on the hot path.
+    std::unordered_map<std::string, SymbolId> symbol_ids_;
 
     EngineTradeCallback  on_trade_;
     EngineRejectCallback on_reject_;
