@@ -1,6 +1,7 @@
 #include "matching_engine.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -79,16 +80,10 @@ SymbolId MatchingEngine::add_symbol(const std::string& symbol)
 
     const SymbolId sid = next_symbol_id_++;
 
-    // Per-book callback wraps the engine-level callback with the symbol name.
-    // Captured by value — lambda must outlive the add_symbol call.
-    TradeCallback book_cb = nullptr;
-    if (on_trade_) {
-        book_cb = [this, symbol](const Trade& t) {
-            on_trade_(symbol, t);
-        };
-    }
-
-    books_[sid] = std::make_unique<OrderBook>(symbol, std::move(book_cb));
+    // Phase 4 Change 3: OrderBook no longer takes a TradeCallback.
+    // MatchingEngine::make_exec() calls on_trade_ directly — one less
+    // indirection through a std::function wrapper per fill.
+    symbols_[sid].book = std::make_unique<OrderBook>(symbol);
     symbol_ids_[symbol] = sid;
     return sid;
 }
@@ -102,20 +97,16 @@ bool MatchingEngine::has_symbol(const std::string& symbol) const
 
 // Internal helpers
 
-// O(1): single bounds check + array slot read.  No string work.
 OrderBook* MatchingEngine::get_book(SymbolId sid) noexcept
 {
-    return (sid < MAX_SYMBOLS) ? books_[sid].get() : nullptr;
+    return (sid < MAX_SYMBOLS) ? symbols_[sid].book.get() : nullptr;
 }
 
 const OrderBook* MatchingEngine::get_book(SymbolId sid) const noexcept
 {
-    return (sid < MAX_SYMBOLS) ? books_[sid].get() : nullptr;
+    return (sid < MAX_SYMBOLS) ? symbols_[sid].book.get() : nullptr;
 }
 
-// Returns MAX_SYMBOLS as sentinel when symbol is unknown.
-// get_book(MAX_SYMBOLS) returns nullptr, which do_submit handles as rejection.
-// Never called on the hot path.
 SymbolId MatchingEngine::resolve(const std::string& symbol) const noexcept
 {
     auto it = symbol_ids_.find(symbol);
@@ -129,22 +120,134 @@ void MatchingEngine::record_latency(std::uint64_t ns) noexcept
     if (ns > stats_.max_latency_ns) stats_.max_latency_ns = ns;
 }
 
-void MatchingEngine::accumulate_trades(const std::vector<Trade>& trades) noexcept
+void MatchingEngine::accumulate_trades(const TradeRing& ring) noexcept
 {
-    stats_.trades_executed += trades.size();
-    for (const Trade& t : trades)
+    stats_.trades_executed += ring.size();
+    for (const Trade& t : ring)
         stats_.total_volume += t.quantity;
+}
+
+
+
+// make_exec — build one Trade, stamp ts if callback is set, fire callback.
+//
+// Moved from OrderBook::make_trade() — now in the same TU as match() and
+// do_submit(), giving the compiler full visibility for inlining.
+// Writes directly to bk.trade_seq_ via friend access.
+
+Trade MatchingEngine::make_exec(OrderBook& bk, Order& buy, Order& sell,
+                                 Price px, Quantity qty)
+{
+    ++bk.trade_seq_;
+    Trade t{
+        .buy_order_id  = buy.id,
+        .sell_order_id = sell.id,
+        .price         = px,
+        .quantity      = qty,
+        .trade_seq     = bk.trade_seq_,
+        // ts stamped only when a callback is registered — Clock::now() costs ~23 ns.
+        .ts            = on_trade_ ? Clock::now() : TimePoint{},
+    };
+    // Engine-level callback called directly: no per-book std::function wrapper,
+    // no lambda capture overhead on the benchmarked path (on_trade_ is nullptr
+    // in all benchmarks).
+    if (on_trade_) on_trade_(bk.symbol_, t);
+    return t;
+}
+
+
+
+// match — core matching loop (price-time priority)
+//
+// Phase 4 Change 3: moved from order_book.cpp to matching_engine.cpp.
+// Being in the same TU as do_submit() allows the compiler to inline the full
+// order lifecycle — no cross-TU call overhead between do_submit and match.
+//
+// Writes fills into engine-owned trade_ring_ (no heap allocation).
+// Accesses bk.asks_ / bk.bids_ / bk.index_ / bk.pool_ via friend.
+//
+// Hot path (real fills):
+//   side_book.has_best_         — flag check, no indirection
+//   lvl.front() / lvl.unlink() — intrusive list, no alloc
+//   erase_level()               — flag flip + advance_best() scan
+//
+// FOK simulate path (simulate_only == true):
+//   BookSide::simulate_fill()  — read-only walk, no book mutations.
+
+void MatchingEngine::match(OrderBook& bk, SymbolState& /*ss*/,
+                            Order& aggressor, bool simulate_only) noexcept
+{
+    const bool is_buy = aggressor.side == Side::Buy;
+
+    auto prices_cross = [&](Price resting_px) noexcept -> bool {
+        if (aggressor.type == OrderType::Market) return true;
+        return is_buy ? (aggressor.price >= resting_px)
+                      : (aggressor.price <= resting_px);
+    };
+
+    if (simulate_only) {
+        // FOK pre-check — no book mutations, just decrement remaining_qty.
+        if (is_buy) bk.asks_.simulate_fill(aggressor, prices_cross);
+        else        bk.bids_.simulate_fill(aggressor, prices_cross);
+        return;
+    }
+
+    // Real match path.
+    // Templated lambda: compiler sees the concrete BookSide<IsBid> type and
+    // can inline erase_level / advance_best with the correct direction.
+    auto run = [&](auto& side_book) noexcept {
+        while (aggressor.is_active() && side_book.has_best_) {
+            PriceLevel& lvl = side_book.levels_[side_book.best_idx_];
+            if (!prices_cross(lvl.price)) break;
+
+            while (aggressor.is_active() && !lvl.empty()) {
+                Order* resting = lvl.front();
+                assert(resting && resting->is_active());
+
+                const Quantity fill_qty = std::min(aggressor.remaining_qty,
+                                                   resting->remaining_qty);
+                const Price    fill_px  = resting->price;
+
+                aggressor.fill(fill_qty);
+                resting->fill(fill_qty);
+                lvl.total_qty -= fill_qty;
+
+                Order& buy_o  = is_buy ? aggressor : *resting;
+                Order& sell_o = is_buy ? *resting  : aggressor;
+                trade_ring_.push(make_exec(bk, buy_o, sell_o, fill_px, fill_qty));
+
+                if (!resting->is_active()) {
+                    bk.index_.erase(resting->id);
+                    lvl.unlink(resting);
+                    bk.pool_.deallocate(resting);
+                }
+            }
+
+            if (lvl.empty())
+                side_book.erase_level(side_book.best_idx_);
+        }
+    };
+
+    if (is_buy) run(bk.asks_);
+    else        run(bk.bids_);
 }
 
 
 
 // do_submit — single internal path for all order types
 //
-// All public submit_* methods funnel here.  Stat accounting, latency
-// measurement, and error handling live in exactly one place.
+// Phase 4 Change 3: add_order() logic absorbed directly here.
+// All of match(), make_exec(), and do_submit() are now in the same TU —
+// the compiler can inline the full order lifecycle into one function body.
 //
-// Takes SymbolId — all symbol resolution is done by callers.
-// The string path (resolve → SymbolId → do_submit) is off the hot path.
+// Sequence:
+//   1. Resolve book + guard                     (array read, O(1))
+//   2. Price bounds check (limit only)
+//   3. Start timer, bump order_seq
+//   4. FOK pre-check via simulate match         (read-only book walk)
+//   5. Pool alloc + real match                  (fills → trade_ring_)
+//   6. Post-match TIF handling (rest / cancel)
+//   7. Record latency → bk.stats_ + engine stats_
 
 OrderResult MatchingEngine::do_submit(SymbolId  sid,
                                       Side      side,
@@ -153,8 +256,8 @@ OrderResult MatchingEngine::do_submit(SymbolId  sid,
                                       OrderType type,
                                       TIF       tif)
 {
-    // Single array slot read — no string hash, no bucket scan.
     OrderBook* bk = get_book(sid);
+
     if (!bk) [[unlikely]] {
         OrderResult r;
         r.order_id      = 0;
@@ -165,49 +268,105 @@ OrderResult MatchingEngine::do_submit(SymbolId  sid,
         return r;
     }
 
-    const OrderId id = next_id_++;
-    ++stats_.orders_received;
+    SymbolState& ss = symbols_[sid];   // sid validated by get_book above
+    {
 
-    // add_order times itself internally; last_ns() reads that sample back.
-    // Avoids two redundant Clock::now() calls that would bracket add_order here.
-    std::vector<Trade> trades = bk->add_order(id, price, qty, side, type, tif);
-    const std::uint64_t elapsed_ns = bk->latency_stats().last_ns();
-
-    record_latency(elapsed_ns);
-    accumulate_trades(trades);
-
-    const bool fok_rejected = (tif == TIF::FOK) && trades.empty();
-
-    OrderResult result;
-    result.order_id = id;
-    result.trades   = std::move(trades);
-
-    if (fok_rejected) {
-        result.accepted      = false;
-        result.reject_reason = "FOK: insufficient liquidity";
-        ++stats_.orders_rejected;
-        if (on_reject_) on_reject_(id, result.reject_reason);
-    } else {
-        result.accepted = true;
-
-        Quantity filled = 0;
-        for (const Trade& t : result.trades)
-            filled += t.quantity;
-
-        if (filled == qty) {
-            ++stats_.orders_filled;
-        } else if (filled > 0) {
-            ++stats_.orders_partial;
+        // Price bounds check — limit orders only.
+        // Market orders use MARKET_PRICE sentinel; skip.
+        if (type == OrderType::Limit) {
+            const Price base = bk->bids_.base_tick_;
+            if (price < base ||
+                static_cast<uint32_t>(price - base) >= BookSide<true>::MAX_TICKS)
+            {
+                throw std::out_of_range(
+                    "price outside book window [base_tick, base_tick + MAX_TICKS)");
+            }
         }
-    }
 
-    return result;
+        const OrderId id = next_id_++;
+        ++stats_.orders_received;
+
+        const auto t0 = Clock::now();
+        ++ss.order_seq;
+
+        // Clear once — match() writes fills here; simulate path does not touch it.
+        trade_ring_.clear();
+
+        // FOK pre-check — simulate fill on a stack probe, no book mutations.
+        if (tif == TIF::FOK && type == OrderType::Limit) {
+            Order probe(id, price, qty, side, type, tif, ss.order_seq);
+            match(*bk, ss, probe, /*simulate_only=*/true);
+            if (probe.remaining_qty > 0) {
+                bk->stats_.record(Clock::now() - t0);
+                record_latency(bk->stats_.last_ns());
+                ++stats_.orders_rejected;
+                OrderResult r;
+                r.order_id      = id;
+                r.accepted      = false;
+                r.reject_reason = "FOK: insufficient liquidity";
+                if (on_reject_) on_reject_(id, r.reject_reason);
+                return r;
+            }
+        }
+
+        // Allocate from pool and run the real match.
+        Order* o = bk->pool_.allocate(id, price, qty, side, type, tif, ss.order_seq);
+        match(*bk, ss, *o, /*simulate_only=*/false);
+
+        // Post-match TIF handling
+        if (!o->is_active()) {
+            // Fully filled — return pool slot immediately.
+            bk->pool_.deallocate(o);
+        } else if (type == OrderType::Market ||
+                   tif  == TIF::IOC         ||
+                   tif  == TIF::FOK)
+        {
+            // Market / IOC / FOK: cancel remaining; never rests.
+            o->cancel();
+            bk->pool_.deallocate(o);
+        } else {
+            // GTC Limit: rest the unfilled remainder on the correct side.
+            auto rest = [&](auto& side_book) {
+                const uint32_t idx = side_book.find_or_insert_idx(price);
+                side_book.levels_[idx].push_back(o);
+                bk->index_.insert(id, idx, o);
+            };
+            if (side == Side::Buy) rest(bk->bids_);
+            else                   rest(bk->asks_);
+        }
+
+        bk->stats_.record(Clock::now() - t0);
+        const std::uint64_t elapsed_ns = bk->stats_.last_ns();
+        record_latency(elapsed_ns);
+        accumulate_trades(trade_ring_);
+
+        const bool fok_rejected = (tif == TIF::FOK) && trade_ring_.empty();
+
+        OrderResult result;
+        result.order_id = id;
+        if (!trade_ring_.empty()) result.trades = trade_ring_.to_vector();
+
+        if (fok_rejected) {
+            result.accepted      = false;
+            result.reject_reason = "FOK: insufficient liquidity";
+            ++stats_.orders_rejected;
+            if (on_reject_) on_reject_(id, result.reject_reason);
+        } else {
+            result.accepted = true;
+            Quantity filled = 0;
+            for (const Trade& t : result.trades)
+                filled += t.quantity;
+            if (filled == qty)  ++stats_.orders_filled;
+            else if (filled > 0) ++stats_.orders_partial;
+        }
+
+        return result;
+    }  // end inner block
 }
 
 
 
 // Public submission API — SymbolId overloads (hot path)
-// Single array slot read in do_submit; no string work anywhere.
 
 
 OrderResult MatchingEngine::submit_limit(SymbolId sid, Side side, Price price,
@@ -244,7 +403,16 @@ bool MatchingEngine::cancel_order(SymbolId sid, OrderId id)
 {
     OrderBook* bk = get_book(sid);
     if (!bk) return false;
-    const bool cancelled = bk->cancel_order(id);
+
+    // Phase 4 Change 3: cancel_order logic moved here from OrderBook.
+    // Direct friend access to index_ and the correct BookSide::cancel().
+    Locator* loc = bk->index_.find(id);
+    if (!loc) return false;
+
+    const bool cancelled = (loc->order->side == Side::Buy)
+        ? bk->bids_.cancel(id)
+        : bk->asks_.cancel(id);
+
     if (cancelled) ++stats_.orders_cancelled;
     return cancelled;
 }
@@ -252,7 +420,6 @@ bool MatchingEngine::cancel_order(SymbolId sid, OrderId id)
 
 
 // Public submission API — string wrappers (off hot path)
-// Resolve symbol → SymbolId once, then delegate to do_submit.
 
 
 OrderResult MatchingEngine::submit_limit(const std::string& symbol, Side side,
