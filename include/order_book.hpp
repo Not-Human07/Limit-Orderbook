@@ -248,6 +248,7 @@ public:
     std::vector<std::pair<Price, Quantity>> depth(std::size_t n) const;
 
     friend class OrderBook;
+    friend class MatchingEngine;
 
 private:
     [[nodiscard]] uint32_t tick_to_idx(Price px) const noexcept {
@@ -332,23 +333,55 @@ struct LatencyStats {
         return count ? samples[(write_pos - 1) & (kBuckets - 1)] : 0;
     }
 };
-// OrderBook
+// TradeRing — pre-allocated flat array of Trade slots.
+// Owned by MatchingEngine as trade_ring_ — one instance reused across every
+// do_submit call (single-threaded contract).  No heap allocation in the fill loop.
+//
+// match()     writes one slot per fill (array store, no malloc).
+// do_submit() clears once at entry, calls to_vector() only when fills exist.
+// The resting path (no fills) never triggers a heap allocation.
+struct TradeRing {
+    static constexpr std::uint32_t CAPACITY = 64;
+
+    Trade         slots[CAPACITY];
+    std::uint32_t count{0};
+
+    void clear() noexcept { count = 0; }
+
+    void push(const Trade& t) noexcept {
+        assert(count < CAPACITY);   // fires in debug if > 64 fills in one sweep
+        slots[count++] = t;
+    }
+
+    [[nodiscard]] bool          empty() const noexcept { return count == 0; }
+    [[nodiscard]] std::uint32_t size()  const noexcept { return count; }
+
+    const Trade* begin() const noexcept { return slots; }
+    const Trade* end()   const noexcept { return slots + count; }
+
+    // Build a vector copy — called by do_submit only when count > 0.
+    // The resting path (no fills) never reaches this.
+    [[nodiscard]] std::vector<Trade> to_vector() const {
+        return std::vector<Trade>(begin(), end());
+    }
+};
+// OrderBook — pure data structure.
+// Phase 4 Change 3: matching logic, callbacks, seq_, and trade_ring_ moved to
+// MatchingEngine.  OrderBook holds only the book data and query interface.
+//
+// MatchingEngine has friend access and drives all mutations via match() and
+// make_exec() which live in matching_engine.cpp (same TU as do_submit —
+// the compiler can inline the full lifecycle without cross-TU call overhead).
+//
+// LatencyStats and trade_seq_ remain here so benchmarks can read them via
+// eng.book(sym)->latency_stats() without file changes.
 class OrderBook {
 public:
-    // level_capacity kept for API compatibility with MatchingEngine — unused
-    // internally (the flat array needs no pre-sizing).
     explicit OrderBook(std::string symbol,
-                       TradeCallback on_trade       = nullptr,
-                       std::size_t   pool_size      = 1 << 20,
-                       std::size_t   level_capacity = 4096,
-                       Price         base_tick      = PRICE(88.00));
-    std::vector<Trade> add_order(OrderId   id,
-                                  Price     price,
-                                  Quantity  qty,
-                                  Side      side,
-                                  OrderType type = OrderType::Limit,
-                                  TIF       tif  = TIF::GTC);
-    bool cancel_order(OrderId id);
+                       std::size_t pool_size = 1 << 20,
+                       Price       base_tick = PRICE(88.00));
+
+    // Read-only queries
     [[nodiscard]] std::optional<Price> best_bid()  const;
     [[nodiscard]] std::optional<Price> best_ask()  const;
     [[nodiscard]] std::optional<Price> mid_price() const;
@@ -357,22 +390,31 @@ public:
     std::vector<std::pair<Price, Quantity>> bid_depth(std::size_t n = 10) const;
     [[nodiscard]]
     std::vector<std::pair<Price, Quantity>> ask_depth(std::size_t n = 10) const;
-    [[nodiscard]] std::uint64_t order_count()  const noexcept { return seq_; }
-    [[nodiscard]] std::uint64_t trade_count()  const noexcept { return trade_seq_; }
+
+    // Diagnostic counters.
+    // order_count: live orders currently held in the pool.
+    // trade_count: cumulative fills on this book (written by MatchingEngine).
+    [[nodiscard]] std::uint64_t order_count() const noexcept {
+        return pool_.capacity() - pool_.available();
+    }
+    [[nodiscard]] std::uint64_t trade_count() const noexcept { return trade_seq_; }
+
+    // Latency stats — populated by MatchingEngine::do_submit().
+    // Exposed here so bench files can read via eng.book(sym)->latency_stats().
     [[nodiscard]] const LatencyStats& latency_stats() const noexcept { return stats_; }
+
     void print_top(std::size_t levels = 5) const;
+
 private:
-    std::vector<Trade> match(Order& aggressor, bool simulate_only = false);
-    Trade make_trade(Order& buy, Order& sell, Price px, Quantity qty);
-    std::string          symbol_;
-    TradeCallback        on_trade_;
+    friend class MatchingEngine;
+
+    std::string          symbol_;       // diagnostic / callback use only
     PoolAllocator<Order> pool_;
     OrderIndex           index_;
     BookSide<true>       bids_;
     BookSide<false>      asks_;
-    SeqNum               seq_{0};
-    SeqNum               trade_seq_{0};
-    LatencyStats         stats_;
+    SeqNum               trade_seq_{0}; // written by MatchingEngine::make_exec()
+    LatencyStats         stats_;        // written by MatchingEngine::do_submit()
 };
 // BookSide method implementations (in header — templates require visibility)
 template <bool IsBid>
