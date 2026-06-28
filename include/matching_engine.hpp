@@ -148,10 +148,21 @@ public:
     void print_stats() const    { stats_.print(); }
 
 private:
-    // Maximum symbols supported.  256 × 8 bytes = 2 KB — fits in L1.
+    // Maximum symbols supported.  256 slots.
     static constexpr SymbolId MAX_SYMBOLS = 256;
 
-    // Single internal submit path — SymbolId only, no string work.
+    // Per-symbol runtime state.
+    // book      : owned OrderBook; nullptr = slot unused.
+    // order_seq : monotonically increasing sequence number per book.
+    //             Replaces the seq_ that used to live in OrderBook.
+    struct SymbolState {
+        std::unique_ptr<OrderBook> book;
+        SeqNum                     order_seq{0};
+    };
+
+    // Helpers
+
+    // Single internal submit path — all public submit_* methods funnel here.
     OrderResult do_submit(SymbolId  sid,
                           Side      side,
                           Price     price,
@@ -159,29 +170,40 @@ private:
                           OrderType type,
                           TIF       tif);
 
-    // O(1) book lookup by id.  Returns nullptr for out-of-range / unknown sid.
+    // Core matching loop — same TU as do_submit so the compiler can inline.
+    // Writes fills into trade_ring_.  Returns void — no alloc.
+    void  match   (OrderBook& bk, SymbolState& ss,
+                   Order& aggressor, bool simulate_only) noexcept;
+
+    // Build one Trade, increment bk.trade_seq_, fire on_trade_ if set.
+    Trade make_exec(OrderBook& bk, Order& buy, Order& sell,
+                    Price px, Quantity qty);
+
+    // O(1) book lookup — single bounds check + array slot read.
     OrderBook*       get_book(SymbolId sid)       noexcept;
     const OrderBook* get_book(SymbolId sid) const noexcept;
 
-    // String → SymbolId.  Returns MAX_SYMBOLS (sentinel) if symbol unknown.
+    // String → SymbolId.  Returns MAX_SYMBOLS (sentinel) if unknown.
     // Never called on the hot path.
     SymbolId resolve(const std::string& symbol) const noexcept;
 
-    void record_latency   (std::uint64_t ns) noexcept;
-    void accumulate_trades(const std::vector<Trade>& trades) noexcept;
+    void record_latency   (std::uint64_t ns)      noexcept;
+    void accumulate_trades(const TradeRing& ring)  noexcept;
 
     // Members
 
     OrderId  next_id_        { 1 };
     SymbolId next_symbol_id_ { 0 };
 
-    // Direct-indexed book array — O(1) lookup, no hash, no heap chase.
-    // 256 × sizeof(unique_ptr) = 2 KB, fits in L1.
-    std::array<std::unique_ptr<OrderBook>, MAX_SYMBOLS> books_{};
+    // Direct-indexed per-symbol state — O(1) lookup, no string hash.
+    std::array<SymbolState, MAX_SYMBOLS> symbols_{};
 
-    // String → SymbolId mapping.  Touched only at add_symbol time, never
-    // on the hot path.
+    // String → SymbolId — touched only at add_symbol time, never on hot path.
     std::unordered_map<std::string, SymbolId> symbol_ids_;
+
+    // Single TradeRing reused across every do_submit call.
+    // Single-threaded contract — one call active at a time.
+    TradeRing trade_ring_;
 
     EngineTradeCallback  on_trade_;
     EngineRejectCallback on_reject_;
