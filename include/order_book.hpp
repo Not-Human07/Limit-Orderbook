@@ -309,6 +309,19 @@ private:
     PoolAllocator<Order>& pool_;
     Price                 base_tick_;
 };
+// RDTSC — fast cycle counter (x86-64)
+// Cost: ~3 cycles (~1 ns) vs ~23 ns for clock_gettime/steady_clock::now().
+// Used by MatchingEngine::do_submit() to time every add_order call.
+[[nodiscard]] inline std::uint64_t rdtsc() noexcept {
+    std::uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return (static_cast<std::uint64_t>(hi) << 32) | lo;
+}
+// Calibrate RDTSC against wall clock once at startup.
+// Returns nanoseconds per tick (multiply tick delta by this to get ns).
+// Defined in order_book.cpp — called by MatchingEngine constructor.
+double rdtsc_ns_per_tick() noexcept;
+
 // LatencyStats — ring-buffer of per-call nanosecond samples
 struct LatencyStats {
     static constexpr std::size_t kBuckets = 1 << 14;  // 16 384 samples
@@ -317,9 +330,10 @@ struct LatencyStats {
     std::size_t write_pos{0};
     std::size_t count{0};
 
-    void record(std::chrono::nanoseconds ns) noexcept {
-        samples[write_pos & (kBuckets - 1)] =
-            static_cast<std::uint64_t>(ns.count());
+    // ns: elapsed nanoseconds — pass rdtsc tick delta converted via ns_per_tick,
+    //     or any uint64_t nanosecond value.
+    void record(std::uint64_t ns) noexcept {
+        samples[write_pos & (kBuckets - 1)] = ns;
         ++write_pos;
         if (count < kBuckets) ++count;
     }
@@ -366,6 +380,7 @@ struct TradeRing {
     }
 };
 // OrderBook — pure data structure.
+//
 // Phase 4 Change 3: matching logic, callbacks, seq_, and trade_ring_ moved to
 // MatchingEngine.  OrderBook holds only the book data and query interface.
 //
