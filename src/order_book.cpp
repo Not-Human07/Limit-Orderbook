@@ -26,6 +26,35 @@ LatencyStats::Percentiles LatencyStats::compute() const
     };
 }
 
+// rdtsc_ns_per_tick — one-time calibration: nanoseconds per TSC tick.
+// Runs a ~10 ms spin measured against steady_clock, returns ns/tick.
+// Called once from MatchingEngine constructor (untimed region).
+double rdtsc_ns_per_tick() noexcept
+{
+    using namespace std::chrono;
+    // Warmup: let the CPU reach steady frequency before measuring.
+    {
+        volatile std::uint64_t s = 0;
+        const std::uint64_t r0 = rdtsc();
+        for (std::uint64_t i = 0; i < 1'000'000; ++i) s += i;
+        (void)(rdtsc() - r0); (void)s;
+    }
+    // Timed pass: spin ~10 ms and compare TSC ticks to wall ns.
+    const auto    wt0 = steady_clock::now();
+    const std::uint64_t rt0 = rdtsc();
+    {
+        volatile std::uint64_t s = 0;
+        for (std::uint64_t i = 0; i < 20'000'000; ++i) s += i;
+        (void)s;
+    }
+    const std::uint64_t rt1 = rdtsc();
+    const auto    wt1 = steady_clock::now();
+    const double wall_ns = static_cast<double>(
+        duration_cast<nanoseconds>(wt1 - wt0).count());
+    const double ticks   = static_cast<double>(rt1 - rt0);
+    return (ticks > 0.0 && wall_ns > 0.0) ? wall_ns / ticks : 0.33;  // fallback 3 GHz
+}
+
 // OrderBook constructor
 // Phase 4 Change 3: TradeCallback and level_capacity removed.
 // Matching logic lives in MatchingEngine — book is pure data.
