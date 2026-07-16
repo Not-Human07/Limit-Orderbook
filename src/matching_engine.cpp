@@ -6,6 +6,11 @@
 #include <iostream>
 #include <stdexcept>
 
+// RDTSC calibration constant — nanoseconds per tick.
+// Initialised once (magic static) before any benchmark runs.
+// multiply-by-reciprocal is ~3 cycles; cheaper than dividing by ticks_per_ns.
+static const double g_ns_per_tick = rdtsc_ns_per_tick();
+
 
 // EngineStats
 
@@ -286,7 +291,8 @@ OrderResult MatchingEngine::do_submit(SymbolId  sid,
         const OrderId id = next_id_++;
         ++stats_.orders_received;
 
-        const auto t0 = Clock::now();
+        // RDTSC: ~3 cycles vs ~23 ns for Clock::now() — saves ~40 ns per order.
+        const std::uint64_t t0 = rdtsc();
         ++ss.order_seq;
 
         // Clear once — match() writes fills here; simulate path does not touch it.
@@ -297,7 +303,8 @@ OrderResult MatchingEngine::do_submit(SymbolId  sid,
             Order probe(id, price, qty, side, type, tif, ss.order_seq);
             match(*bk, ss, probe, /*simulate_only=*/true);
             if (probe.remaining_qty > 0) {
-                bk->stats_.record(Clock::now() - t0);
+                bk->stats_.record(
+                    static_cast<std::uint64_t>((rdtsc() - t0) * g_ns_per_tick));
                 record_latency(bk->stats_.last_ns());
                 ++stats_.orders_rejected;
                 OrderResult r;
@@ -335,7 +342,8 @@ OrderResult MatchingEngine::do_submit(SymbolId  sid,
             else                   rest(bk->asks_);
         }
 
-        bk->stats_.record(Clock::now() - t0);
+        bk->stats_.record(
+            static_cast<std::uint64_t>((rdtsc() - t0) * g_ns_per_tick));
         const std::uint64_t elapsed_ns = bk->stats_.last_ns();
         record_latency(elapsed_ns);
         accumulate_trades(trade_ring_);
